@@ -30,7 +30,7 @@ NEXUS is a comprehensive career intelligence platform that combines deterministi
 ### Prerequisites
 - Docker and Docker Compose
 - Node.js and npm (for frontend)
-- Python 3.9+ (for backend local development)
+- Python 3.91+ (for backend local development)
 
 ### 1. Backend Setup
 
