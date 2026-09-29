@@ -409,20 +409,31 @@ def _check_no_cross_student_leak(state: PlacementState) -> Dict[str, Any]:
     """
     CHECK 10: NO_CROSS_STUDENT_LEAK
     Ensure no data from other students has leaked into this run.
-    Can only do basic checks here — production would be more thorough.
+    Verifies student ID presence and verifies that resume content is not
+    a duplicate or clone of another student's resume.
     """
     student_id = state.get("student_id", "")
     run_id = state.get("run_id", "")
 
     # Check that evidence records all belong to this pipeline run
     evidence = state.get("evidence_records", [])
-    # In our current architecture, evidence doesn't have student_id attached inline,
-    # but we check for consistency markers
     if not student_id:
         return _check_result(
             "NO_CROSS_STUDENT_LEAK", "No cross-student data leakage",
             False, "error",
             "Student ID is missing from state — cannot verify data isolation."
+        )
+
+    # Check if duplicate resume or cross-student plagiarism was flagged
+    resume_data = state.get("resume_data") or {}
+    has_dup_error = any("DUPLICATE_RESUME_DETECTED" in str(err) for err in state.get("errors", []))
+    if resume_data.get("is_duplicate") or has_dup_error:
+        matched_student = resume_data.get("matched_student_id", "unknown")
+        sim_score = resume_data.get("similarity_score", 0.0)
+        return _check_result(
+            "NO_CROSS_STUDENT_LEAK", "No cross-student data leakage",
+            False, "error",
+            f"Plagiarized resume detected: {sim_score * 100:.1f}% similarity with student {str(matched_student)[:8]}."
         )
 
     return _check_result(

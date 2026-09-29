@@ -9,13 +9,17 @@ import {
   Map,
   User,
   ArrowLeft,
+  Code2,
+  ShieldCheck,
 } from "lucide-react";
 
 const navItems = [
   { key: "overview", label: "Overview", icon: LayoutDashboard, href: "#overview" },
+  { key: "perfection", label: "Resume Perfection", icon: ShieldCheck, href: "#perfection" },
   { key: "companies", label: "Company Matches", icon: Building2, href: "#companies" },
   { key: "roadmap", label: "Learning Roadmap", icon: Map, href: "#roadmap" },
   { key: "skills", label: "Skills & Profile", icon: User, href: "#skills" },
+  { key: "coding", label: "Code Practice", icon: Code2, href: "#coding" },
 ];
 
 interface SidebarProps {

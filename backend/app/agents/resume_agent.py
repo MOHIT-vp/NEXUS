@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_groq import ChatGroq
+from langchain_aws import ChatBedrockConverse
 
 from app.config import settings
 from app.agents.state import PlacementState, AuditEvent
@@ -45,6 +46,14 @@ class ResumeExtraction(BaseModel):
 
 
 def get_resume_llm():
+    if settings.LLM_PROVIDER.lower() == "bedrock":
+        import os
+        return ChatBedrockConverse(
+            model_id=settings.LLM_MODEL,
+            temperature=0.0,
+            region_name=os.getenv("AWS_REGION", "us-east-1"),
+            # Credentials should be picked up from env (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+        )
     if settings.LLM_PROVIDER.lower() == "groq":
         return ChatGroq(
             model=settings.LLM_MODEL,
@@ -142,9 +151,13 @@ def resume_agent_node(state: PlacementState) -> Dict[str, Any]:
             scope_tags=["resume", "student_profile", "skills", "projects"]
         ).model_dump()
         
+        existing_resume_data = state.get("resume_data") or {}
         return {
             "student_profile": profile_update,
-            "resume_data": {"extracted_text": clean_text[:500] + "..."}, # Store snippet for UI
+            "resume_data": {
+                **existing_resume_data,
+                "extracted_text": clean_text[:500] + "...",
+            }, # Store snippet for UI while preserving verification metadata
             "evidence_records": [evidence],
             "audit_events": [audit],
             "current_step": "resume_agent",
@@ -173,9 +186,13 @@ def resume_agent_node(state: PlacementState) -> Dict[str, Any]:
             "experiences": [],
             "education": {"degree": "B.Tech Computer Science", "institution": "University", "gpa": 7.5}
         }
+        existing_resume_data = state.get("resume_data") or {}
         return {
             "student_profile": profile_update,
-            "resume_data": {"extracted_text": "Mock resume text due to parsing failure."},
+            "resume_data": {
+                **existing_resume_data,
+                "extracted_text": "Mock resume text due to parsing failure.",
+            },
             "errors": [f"Resume Agent Failed: {str(e)} - used fallback"],
             "current_step": "resume_agent",
         }

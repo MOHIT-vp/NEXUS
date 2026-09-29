@@ -41,6 +41,7 @@ class StudentDashboard(BaseModel):
     matching_result: Optional[Dict[str, Any]]
     interview_result: Optional[Dict[str, Any]]
     roadmap: Optional[Dict[str, Any]]
+    resume_perfection: Optional[Dict[str, Any]] = None
 
 
 class OfficerQueueSummary(BaseModel):
@@ -120,6 +121,7 @@ async def get_student_dashboard(
         matching_result=snap.get("matching_result"),
         interview_result=snap.get("interview_result"),
         roadmap=snap.get("roadmap"),
+        resume_perfection=snap.get("resume_perfection"),
     )
 
 
@@ -202,13 +204,15 @@ async def get_student_dashboard_by_run(
     if not run:
         raise HTTPException(status_code=404, detail="Workflow run not found.")
 
-    # If not published yet, return status only
+    # If not published yet, return status and any resume perfection quiz data
     if run.status not in ("published", "approved"):
+        snapshot = run.result_snapshot or {}
         return {
             "status": run.status,
             "current_step": run.current_step,
             "has_approved_plan": False,
             "data": None,
+            "resume_perfection": snapshot.get("resume_perfection"),
         }
 
     # Check for a published Version
@@ -255,8 +259,9 @@ async def get_student_dashboard_by_run(
         company_matches = []
         for m in matches:
             company_matches.append({
+                "job_id": m.get("job_id"),
                 "company": m.get("company_name", "Unknown"),
-                "role": m.get("job_title", m.get("role", "Software Engineer")),
+                "role": m.get("job_title", m.get("role_title", m.get("role", "Software Engineer"))),
                 "match_score": m.get("match_percentage", m.get("match_score", 0)),
                 "confidence": str(m.get("confidence", 0)),
                 "package_lpa": m.get("package_lpa", 0),
@@ -297,6 +302,7 @@ async def get_student_dashboard_by_run(
                     "education": student_profile.get("education"),
                     "summary": student_profile.get("summary", ""),
                 },
+                "resume_perfection": snapshot.get("resume_perfection"),
                 "stats": {
                     "total_skills": len(student_profile.get("skills", [])),
                     "total_projects": len(student_profile.get("projects", [])),

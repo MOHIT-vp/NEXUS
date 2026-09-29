@@ -127,22 +127,53 @@ Get detailed skill requirements for a role. **Auth**: Any authenticated.
 
 ---
 
-## 7. Companies
+## 7. Companies & Campus Recruitment Drives
 
 ### GET /api/v1/companies
-List companies. **Auth**: Any authenticated.
+List recruitment drives and companies with search and filtering. **Auth**: Any authenticated.
 ```
-Query: ?industry=technology&is_active=true&page=1
+Query: ?search=tech&domain=AI/ML&page=1
 ```
 
-### GET /api/v1/companies/{company_id}
-Get company details with available roles. **Auth**: Any authenticated.
+### GET /api/v1/companies/jobs/{job_id}
+Get specific recruitment drive details. **Auth**: Any authenticated.
 
 ### POST /api/v1/companies
-Create company. **Auth**: Admin, Officer.
+List a new recruitment drive / company. **Auth**: Admin, Officer.
+```
+Request: {
+  company_name, role_title, domain, ctc_lpa, min_cgpa, max_backlogs,
+  required_skills, preferred_skills, drive_date, location, rounds
+}
+```
 
-### PUT /api/v1/companies/{company_id}
-Update company. **Auth**: Admin, Officer.
+### PUT /api/v1/companies/jobs/{job_id}
+Update a recruitment drive. **Auth**: Admin, Officer.
+
+### DELETE /api/v1/companies/jobs/{job_id}
+Delete/archive a recruitment drive. **Auth**: Admin, Officer.
+
+### POST /api/v1/companies/jobs/{job_id}/check-preparedness
+Evaluate student preparedness and skill match against company requirements. **Auth**: Student, Officer.
+```
+Request: {
+  student_id, student_skills, coding_score, project_score, interview_score, cgpa, backlogs
+}
+Response: {
+  overall_score, match_tier, is_cgpa_eligible, is_backlog_eligible, is_fully_eligible,
+  component_scores, matched_skills, missing_skills, recommendations, roadmap_2_week
+}
+```
+
+### GET /api/v1/companies/jobs/{job_id}/cohort-readiness
+Compute cohort-wide readiness analytics across all registered students. **Auth**: Officer, Admin.
+```
+Response: {
+  total_candidates, eligible_candidates, eligibility_rate,
+  high_match_count, medium_match_count, low_match_count,
+  top_missing_skills: [{ skill, missing_count, percentage }]
+}
+```
 
 ---
 

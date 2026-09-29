@@ -1,13 +1,15 @@
 "use client";
 
 import { cn } from "@/lib/utils";
-import { LayoutDashboard, Building2, Map, User } from "lucide-react";
+import { LayoutDashboard, Building2, Map, User, Code2, ShieldCheck } from "lucide-react";
 
 const navItems = [
   { key: "overview", label: "Overview", icon: LayoutDashboard },
+  { key: "perfection", label: "Perfection", icon: ShieldCheck },
   { key: "companies", label: "Companies", icon: Building2 },
   { key: "roadmap", label: "Roadmap", icon: Map },
   { key: "skills", label: "Profile", icon: User },
+  { key: "coding", label: "Code", icon: Code2 },
 ];
 
 interface MobileNavProps {

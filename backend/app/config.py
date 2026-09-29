@@ -1,6 +1,7 @@
 """Application configuration via environment variables."""
 from pydantic_settings import BaseSettings
-from typing import List
+from pydantic import field_validator
+from typing import Any, List, Union
 import os
 
 
@@ -11,6 +12,13 @@ class Settings(BaseSettings):
     APP_NAME: str = "Placement Readiness & Career Intelligence Portal"
     APP_VERSION: str = "0.1.0"
     DEBUG: bool = False
+
+    @field_validator("DEBUG", mode="before")
+    @classmethod
+    def parse_debug(cls, v: Any) -> bool:
+        if isinstance(v, str):
+            return v.lower() in ("true", "1", "yes", "debug", "dev")
+        return bool(v)
 
     # Database
     DATABASE_URL: str = "postgresql+asyncpg://placement_user:placement_pass@localhost:5432/placement_portal"

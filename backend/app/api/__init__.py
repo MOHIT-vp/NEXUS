@@ -3,7 +3,8 @@ from fastapi import APIRouter
 
 from app.api.v1 import auth, workflows, resumes, evidence, approvals, versions, consents, process
 from app.api.v1 import profiles, analysis, matching, interviews
-from app.api.v1 import dashboard, admin, chat
+from app.api.v1 import dashboard, admin, chat, companies
+from app.api.v1 import coding
 
 # Initialize the v1 router
 api_router = APIRouter()
@@ -30,3 +31,9 @@ api_router.include_router(admin.router)
 
 # Chatbot Integration
 api_router.include_router(chat.router)
+
+# Recruitment Drives & Company Preparedness
+api_router.include_router(companies.router)
+
+# Coding Practice
+api_router.include_router(coding.router)

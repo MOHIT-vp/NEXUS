@@ -71,9 +71,17 @@ LOW_CONFIDENCE_THRESHOLD = 0.6
 
 def _get_mock_available_jobs() -> List[Dict[str, Any]]:
     """
-    Returns mock job listings.
-    In production, this comes from the RoleConnector → jobs table.
+    Returns available job listings from company_service (including newly listed drives).
+    Falls back to baseline if company_service is not initialized.
     """
+    try:
+        from app.services.company_service import company_service
+        drives = company_service.get_all_jobs_for_matching()
+        if drives:
+            return drives
+    except Exception:
+        pass
+
     return [
         {
             "job_id": "job-001",
@@ -386,6 +394,25 @@ def _score_single_job(
     )
     max_total = sum(c["max_points"] for c in config.values())
 
+    # Extract matched and missing skill lists using canonicalization
+    try:
+        from app.services.company_service import canonicalize_skill
+    except Exception:
+        canonicalize_skill = lambda s: s.strip().lower()
+
+    student_skill_names = {s.get("name", "").lower().strip() for s in student_profile.get("skills", [])}
+    student_canonical = {canonicalize_skill(s.get("name", "")) for s in student_profile.get("skills", [])}
+    req_skills = job.get("required_skills", [])
+    pref_skills = job.get("preferred_skills", [])
+    matched_skills = [
+        s for s in req_skills + pref_skills
+        if s.lower().strip() in student_skill_names or canonicalize_skill(s) in student_canonical
+    ]
+    missing_skills = [
+        s for s in req_skills
+        if s.lower().strip() not in student_skill_names and canonicalize_skill(s) not in student_canonical
+    ]
+
     # Confidence
     confidence = _compute_match_confidence(
         skill_score, coding_score, is_eligible, skill_details, config
@@ -403,6 +430,8 @@ def _score_single_job(
         "confidence": confidence,
         "is_eligible": is_eligible,
         "is_low_confidence": confidence < LOW_CONFIDENCE_THRESHOLD,
+        "matched_skills": matched_skills,
+        "missing_skills": missing_skills,
         "breakdown": [
             {"component": "skill_coverage", "points": skill_score,
              "max": config["skill_coverage"]["max_points"], "details": skill_details},

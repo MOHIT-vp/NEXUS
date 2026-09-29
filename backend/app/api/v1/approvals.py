@@ -261,6 +261,16 @@ async def get_open_approval_queue(
                 "current_step": r.current_step,
                 "submitted_at": r.completed_at.isoformat() if r.completed_at else (r.created_at.isoformat() if r.created_at else None),
                 "created_at": r.created_at.isoformat() if r.created_at else None,
+                "resume_perfection_score": (
+                    (r.result_snapshot or {}).get("resume_perfection", {}).get("evaluation", {}).get("overall_score")
+                    if (r.result_snapshot or {}).get("resume_perfection", {}).get("evaluation")
+                    else None
+                ),
+                "resume_perfection_tier": (
+                    (r.result_snapshot or {}).get("resume_perfection", {}).get("evaluation", {}).get("tier_label")
+                    if (r.result_snapshot or {}).get("resume_perfection", {}).get("evaluation")
+                    else None
+                ),
             }
             for r in runs
         ],

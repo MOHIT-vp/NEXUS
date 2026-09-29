@@ -13,18 +13,31 @@ import os
 import uuid
 import tempfile
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile, Depends
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.orm.attributes import flag_modified
 
+import hashlib
 from app.database import get_db
 from app.models.user import User, Student
-from app.models.workflow import WorkflowRun, AuditLog
+from app.models.profile import Resume
+from app.models.workflow import WorkflowRun, AuditLog, Version
 from app.agents.graph import agent_runner
+from app.agents.tools.resume_tools import extract_text_from_file
+from app.services.resume_validator import verify_resume_uniqueness
 from app.services.audit import log_workflow_events
+from app.services.resume_perfection_service import (
+    ResumePerfectionQuestion,
+    StudentAnswerItem,
+    ResumePerfectionEvaluation,
+    generate_resume_perfection_questions,
+    evaluate_student_answers,
+    sanitize_question_for_client,
+)
 
 router = APIRouter(prefix="/process", tags=["Process"])
 
@@ -44,6 +57,17 @@ class StatusResponse(BaseModel):
     status: str
     current_step: Optional[str] = None
     student_id: Optional[str] = None
+
+
+class ResumePerfectionSubmitRequest(BaseModel):
+    answers: List[StudentAnswerItem]
+
+
+class ResumePerfectionResponse(BaseModel):
+    run_id: str
+    status: str
+    questions: List[Dict[str, Any]]
+    evaluation: Optional[Dict[str, Any]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +201,76 @@ async def process_resume(
         db.add(init_audit)
         await db.commit()
 
+        # Extract text & compute hash for resume uniqueness validation
+        try:
+            raw_text = extract_text_from_file(tmp.name, file.content_type)
+        except Exception:
+            raw_text = ""
+        file_hash = hashlib.sha256(contents).hexdigest()
+
+        # Validate resume uniqueness (catch cross-student clones even with changed names)
+        student_name = None
+        if "user" in student.__dict__ and student.user:
+            student_name = getattr(student.user, "full_name", None)
+        elif getattr(student, "user_id", None):
+            user_res = await db.execute(select(User.full_name).where(User.id == student.user_id))
+            student_name = user_res.scalar_one_or_none()
+
+        verification = await verify_resume_uniqueness(
+            db=db,
+            current_student_id=student.id,
+            raw_text=raw_text,
+            file_hash=file_hash,
+            current_student_name=student_name,
+        )
+
+        if verification.is_duplicate:
+            db_run.status = "failed"
+            db_run.error_message = (
+                f"Resume validation failed: High similarity ({verification.similarity_score * 100:.1f}%) "
+                f"detected with an existing resume from another student."
+            )
+            db_run.completed_at = datetime.now(timezone.utc)
+            reject_audit = AuditLog(
+                actor_id=student.user_id,
+                actor_type="student",
+                workflow_run_id=db_run.id,
+                action="RESUME_REJECTED_DUPLICATE",
+                entity_type="workflow_run",
+                entity_id=db_run.id,
+                correlation_id=uuid.uuid4(),
+                details={
+                    "similarity_score": verification.similarity_score,
+                    "matched_student_id": str(verification.matched_student_id) if verification.matched_student_id else None,
+                    "matched_student_name": verification.matched_student_name,
+                    "reasons": verification.reasons,
+                },
+            )
+            db.add(reject_audit)
+            await db.commit()
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Resume validation failed: High similarity ({verification.similarity_score * 100:.1f}%) "
+                    f"detected with an existing resume from another student ({verification.matched_student_name or 'registered student'})."
+                ),
+            )
+
+        # Register verified resume in DB
+        db_resume = Resume(
+            id=uuid.uuid4(),
+            student_id=student.id,
+            file_name=file.filename,
+            file_path=tmp.name,
+            file_size=len(contents),
+            mime_type=file.content_type,
+            file_hash=file_hash,
+            raw_text=raw_text,
+            status="verified",
+        )
+        db.add(db_resume)
+        await db.commit()
+
         # 4. Build state and invoke the full LangGraph pipeline
         initial_state: Dict[str, Any] = {
             "student_id": str(student.id),
@@ -185,6 +279,10 @@ async def process_resume(
             "resume_data": {
                 "file_path": tmp.name,
                 "mime_type": file.content_type,
+                "raw_text": raw_text,
+                "is_duplicate": False,
+                "similarity_score": verification.similarity_score,
+                "matched_student_id": str(verification.matched_student_id) if verification.matched_student_id else None,
             },
             "target_roles": ["software_engineer", "data_engineer"],
             "current_step": "init",
@@ -224,6 +322,12 @@ async def process_resume(
             raise HTTPException(status_code=500, detail=f"Pipeline execution failed: {str(e)}")
 
         # 5. Build the result snapshot from final state
+        # Generate Resume Perfection verification questions based on extracted profile
+        perfection_questions = generate_resume_perfection_questions(
+            student_profile=final_state.get("student_profile", {}),
+            raw_text=raw_text,
+        )
+
         result_snapshot = {
             "student_profile": final_state.get("student_profile", {}),
             "skill_gap_report": final_state.get("skill_gap_report", {}),
@@ -233,6 +337,11 @@ async def process_resume(
             "roadmap": final_state.get("roadmap", {}),
             "validation_report": final_state.get("validation_report", {}),
             "evidence_count": len(final_state.get("evidence_records", [])),
+            "resume_perfection": {
+                "status": "pending_submission",
+                "questions": [q.model_dump() for q in perfection_questions],
+                "evaluation": None,
+            },
             "metadata": {
                 "github_username": github_username,
                 "leetcode_handle": leetcode_handle,
@@ -316,3 +425,193 @@ async def get_workflow_status(
         current_step=run.current_step,
         student_id=str(run.student_id) if run.student_id else None,
     )
+
+
+# ---------------------------------------------------------------------------
+# Resume Perfection & Authenticity Verification Endpoints
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/runs/{run_id}/resume-perfection",
+    response_model=ResumePerfectionResponse,
+    summary="Get resume perfection questions & current evaluation",
+)
+async def get_resume_perfection(
+    run_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns targeted questions generated from the uploaded resume to evaluate
+    the student's perfection with their own claims. Also returns the evaluation
+    result if already completed.
+    """
+    try:
+        run_uuid = uuid.UUID(run_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid run_id format.")
+
+    result = await db.execute(select(WorkflowRun).where(WorkflowRun.id == run_uuid))
+    run = result.scalar_one_or_none()
+    if not run:
+        raise HTTPException(status_code=404, detail="Workflow run not found.")
+
+    snapshot = run.result_snapshot or {}
+    perf_data = snapshot.get("resume_perfection")
+
+    if not perf_data or not perf_data.get("questions"):
+        student_profile = snapshot.get("student_profile", {})
+        raw_text = snapshot.get("metadata", {}).get("raw_text")
+        questions = generate_resume_perfection_questions(student_profile, raw_text)
+        perf_data = {
+            "status": "pending_submission",
+            "questions": [q.model_dump() for q in questions],
+            "evaluation": None,
+        }
+        snapshot["resume_perfection"] = perf_data
+        run.result_snapshot = dict(snapshot)
+        flag_modified(run, "result_snapshot")
+        await db.commit()
+
+    is_evaluated = perf_data.get("status") == "evaluated"
+    client_questions = [
+        sanitize_question_for_client(q, is_evaluated=is_evaluated)
+        for q in perf_data.get("questions", [])
+    ]
+
+    return ResumePerfectionResponse(
+        run_id=str(run.id),
+        status=perf_data.get("status", "pending_submission"),
+        questions=client_questions,
+        evaluation=perf_data.get("evaluation"),
+    )
+
+
+@router.post(
+    "/runs/{run_id}/resume-perfection/submit",
+    summary="Submit student answers to evaluate resume perfection",
+)
+async def submit_resume_perfection_answers(
+    run_id: str,
+    payload: ResumePerfectionSubmitRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Submits student responses to resume verification questions, computes
+    the perfection score, generates targeted feedback, and persists results.
+    """
+    try:
+        run_uuid = uuid.UUID(run_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid run_id format.")
+
+    result = await db.execute(select(WorkflowRun).where(WorkflowRun.id == run_uuid))
+    run = result.scalar_one_or_none()
+    if not run:
+        raise HTTPException(status_code=404, detail="Workflow run not found.")
+
+    snapshot = run.result_snapshot or {}
+    perf_data = snapshot.get("resume_perfection") or {}
+    raw_questions = perf_data.get("questions") or []
+
+    if not raw_questions:
+        student_profile = snapshot.get("student_profile", {})
+        questions_objs = generate_resume_perfection_questions(student_profile)
+        raw_questions = [q.model_dump() for q in questions_objs]
+
+    # Reconstruct question models
+    questions = [ResumePerfectionQuestion(**q) for q in raw_questions]
+
+    # Evaluate answers
+    evaluation = evaluate_student_answers(questions, payload.answers)
+
+    # Persist in run result_snapshot
+    perf_data["status"] = "evaluated"
+    perf_data["questions"] = raw_questions
+    perf_data["evaluation"] = evaluation.model_dump()
+    snapshot["resume_perfection"] = perf_data
+    run.result_snapshot = dict(snapshot)
+    flag_modified(run, "result_snapshot")
+
+    # If published versions exist for this run, sync them
+    version_result = await db.execute(
+        select(Version).where(Version.workflow_run_id == run_uuid)
+    )
+    versions = version_result.scalars().all()
+    for v in versions:
+        v_snap = v.snapshot or {}
+        v_snap["resume_perfection"] = perf_data
+        v.snapshot = dict(v_snap)
+        flag_modified(v, "snapshot")
+
+    # Add audit log
+    audit = AuditLog(
+        actor_id=run.initiated_by,
+        actor_type="student",
+        workflow_run_id=run.id,
+        action="RESUME_PERFECTION_EVALUATED",
+        entity_type="workflow_run",
+        entity_id=run.id,
+        correlation_id=uuid.uuid4(),
+        details={
+            "score": evaluation.overall_score,
+            "tier": evaluation.perfection_tier,
+            "total_questions": evaluation.total_questions,
+            "correct_count": evaluation.correct_count,
+        },
+    )
+    db.add(audit)
+    await db.commit()
+
+    return {
+        "run_id": str(run.id),
+        "status": "evaluated",
+        "evaluation": evaluation.model_dump(),
+    }
+
+
+@router.post(
+    "/runs/{run_id}/resume-perfection/regenerate",
+    summary="Regenerate resume perfection questions",
+)
+async def regenerate_resume_perfection(
+    run_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Regenerates a fresh set of questions based on resume content."""
+    try:
+        run_uuid = uuid.UUID(run_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid run_id format.")
+
+    result = await db.execute(select(WorkflowRun).where(WorkflowRun.id == run_uuid))
+    run = result.scalar_one_or_none()
+    if not run:
+        raise HTTPException(status_code=404, detail="Workflow run not found.")
+
+    snapshot = run.result_snapshot or {}
+    student_profile = snapshot.get("student_profile", {})
+    raw_text = snapshot.get("metadata", {}).get("raw_text")
+
+    fresh_salt = uuid.uuid4().hex[:6]
+    questions = generate_resume_perfection_questions(student_profile, raw_text, seed_salt=fresh_salt)
+    raw_questions = [q.model_dump() for q in questions]
+    perf_data = {
+        "status": "pending_submission",
+        "questions": raw_questions,
+        "evaluation": None,
+    }
+    snapshot["resume_perfection"] = perf_data
+    run.result_snapshot = dict(snapshot)
+    flag_modified(run, "result_snapshot")
+    await db.commit()
+
+    client_questions = [
+        sanitize_question_for_client(q, is_evaluated=False)
+        for q in raw_questions
+    ]
+
+    return {
+        "run_id": str(run.id),
+        "status": "pending_submission",
+        "questions": client_questions,
+    }
