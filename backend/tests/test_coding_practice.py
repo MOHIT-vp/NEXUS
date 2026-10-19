@@ -22,9 +22,25 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
+from app.api.deps import get_current_user
 from app.main import app
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _signed_in():
+    """Code execution requires a signed-in user; these tests run as one."""
+    from types import SimpleNamespace
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id="test-user", role="student", is_active=True)
+    yield
+    app.dependency_overrides.pop(get_current_user, None)
+
+
+def test_execution_requires_sign_in():
+    app.dependency_overrides.pop(get_current_user, None)
+    r = client.post("/api/v1/coding/execute", json={"problem_id": "two-sum", "code": "x", "language": "python"})
+    assert r.status_code == 401
 
 BASE = "/api/v1/coding"
 

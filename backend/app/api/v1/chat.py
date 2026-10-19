@@ -10,7 +10,9 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
 
+from app.api.deps import get_current_student
 from app.database import get_db
+from app.models.user import Student
 from app.models.workflow import WorkflowRun
 from app.config import settings
 
@@ -58,9 +60,14 @@ Rules:
 """
 
 @router.post("", response_model=ChatResponse)
-async def chat_with_nexus_ai(request: ChatRequest, db: AsyncSession = Depends(get_db)):
+async def chat_with_nexus_ai(
+    request: ChatRequest,
+    student: Student = Depends(get_current_student),
+    db: AsyncSession = Depends(get_db),
+):
+    """Career assistant for the signed-in student. It only ever sees that student's own published plan."""
     assessment_context = ""
-    
+
     if request.run_id:
         try:
             import uuid
@@ -72,11 +79,13 @@ async def chat_with_nexus_ai(request: ChatRequest, db: AsyncSession = Depends(ge
             result = await db.execute(stmt)
             run = result.scalar_one_or_none()
             
+            if run and run.student_id != student.id:
+                run = None  # another student's run: ignore it, never use its data
             if run:
-                if run.status in ["pending", "processing", "validating"]:
+                if run.status not in ("published", "approved"):
                     # The run is not yet published/approved.
                     return ChatResponse(response="Your assessment is currently under placement-cell review. Once it is approved and published, I'll be able to help you interpret your results.")
-                elif run.status in ["published", "approved", "completed"] and run.result_snapshot:
+                elif run.result_snapshot:
                     # Add snapshot to context
                     import json
                     assessment_context = f"\nStudent's Assessment Data (JSON):\n{json.dumps(run.result_snapshot, indent=2)}"

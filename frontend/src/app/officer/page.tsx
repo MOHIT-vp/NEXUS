@@ -1,9 +1,16 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import {
   getApprovalQueue,
   submitDecision,
+  editRun,
+  overrideRun,
+  rollbackVersion,
+  getRunReport,
+  getSessionUser,
+  signOut,
   listRecruitmentDrives,
   deleteRecruitmentDrive,
   JobDrive,
@@ -31,9 +38,20 @@ import { PBButton } from "@/components/ui/pb-button";
 import { Loader } from "@/components/ui/loader";
 import { CreateDriveModal } from "@/components/companies/create-drive-modal";
 import { CohortAnalyticsModal } from "@/components/companies/cohort-analytics-modal";
+import { RunReport } from "@/components/officer/run-report";
+import { BenchmarkEditor } from "@/components/officer/benchmark-editor";
 
 export default function OfficerDashboardPage() {
-  const [activeTab, setActiveTab] = useState<"evaluations" | "drives">("evaluations");
+  const router = useRouter();
+  const [activeTab, setActiveTab] = useState<"evaluations" | "drives" | "benchmarks">("evaluations");
+  // Per-run edit / override panel
+  const [openPanel, setOpenPanel] = useState<{ runId: string; kind: "edit" | "override" | "report" } | null>(null);
+  const [report, setReport] = useState<Record<string, unknown> | null>(null);
+  const [note, setNote] = useState("");
+  const [gapSkill, setGapSkill] = useState("");
+  const [gapText, setGapText] = useState("");
+  const [reason, setReason] = useState("");
+  const [notice, setNotice] = useState<{ ok: boolean; text: string } | null>(null);
 
   // Evaluations queue state
   const [queueData, setQueueData] = useState<any>(null);
@@ -78,8 +96,15 @@ export default function OfficerDashboardPage() {
   };
 
   useEffect(() => {
+    // Only Placement Cell staff can use this console (the server enforces it too)
+    const user = getSessionUser();
+    if (!user || user.role !== "placement_officer") {
+      router.replace("/login?next=/officer");
+      return;
+    }
     loadEvaluationsData();
     loadDrives();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -90,15 +115,65 @@ export default function OfficerDashboardPage() {
 
   const handleDecide = async (runId: string, decision: "approved" | "rejected") => {
     setActionLoading(runId);
+    setNotice(null);
     try {
       await submitDecision(runId, decision);
+      setNotice({ ok: true, text: decision === "approved" ? "Plan approved and published." : "Plan rejected." });
       await loadEvaluationsData();
     } catch (err) {
-      console.error("Decision failed:", err);
-      alert("Failed to submit decision. Check console.");
+      setNotice({ ok: false, text: err instanceof Error ? err.message : "Failed to submit decision." });
     } finally {
       setActionLoading(null);
     }
+  };
+
+  const runAction = async (runId: string, fn: () => Promise<unknown>, success: string) => {
+    setActionLoading(runId);
+    setNotice(null);
+    try {
+      await fn();
+      setNotice({ ok: true, text: success });
+      setOpenPanel(null);
+      setNote(""); setGapSkill(""); setGapText(""); setReason("");
+      await loadEvaluationsData();
+    } catch (err) {
+      setNotice({ ok: false, text: err instanceof Error ? err.message : "Action failed." });
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleEdit = (runId: string) => runAction(runId, async () => {
+    const res = await editRun(runId, {
+      officer_note: note.trim() || undefined,
+      gap_recommendations: gapSkill && gapText.trim() ? { [gapSkill]: gapText.trim() } : undefined,
+    });
+    if (!res.validation_passed) {
+      throw new Error(`Saved, but the edited plan failed validation (${res.failing_checks.join(", ")}) and left the queue.`);
+    }
+  }, "Edit saved and re-validated.");
+
+  const toggleReport = async (runId: string) => {
+    if (openPanel?.runId === runId && openPanel?.kind === "report") {
+      setOpenPanel(null);
+      return;
+    }
+    setReport(null);
+    setOpenPanel({ runId, kind: "report" });
+    try {
+      setReport(await getRunReport(runId));
+    } catch (err) {
+      setOpenPanel(null);
+      setNotice({ ok: false, text: err instanceof Error ? err.message : "Could not load the report." });
+    }
+  };
+
+  const handleOverride = (runId: string) =>
+    runAction(runId, () => overrideRun(runId, reason.trim()), "Override recorded and plan published.");
+
+  const handleRollback = (versionId: string) => {
+    if (!confirm("Roll this student's plan back to the previous version?")) return;
+    runAction(versionId, () => rollbackVersion(versionId), "Plan rolled back to the previous version.");
   };
 
   const handleDeleteDrive = async (jobId: string, companyName: string) => {
@@ -147,12 +222,20 @@ export default function OfficerDashboardPage() {
               List recruitment drives, evaluate candidate readiness, and publish student plans.
             </p>
           </div>
-          <Link
-            href="/"
-            className="text-sm font-medium text-bronze-dark/60 hover:text-charcoal transition-colors flex items-center gap-1.5"
-          >
-            <ArrowLeft className="w-3.5 h-3.5" /> Back to Portal
-          </Link>
+          <div className="flex items-center gap-4">
+            <Link
+              href="/"
+              className="text-sm font-medium text-bronze-dark/60 hover:text-charcoal transition-colors flex items-center gap-1.5"
+            >
+              <ArrowLeft className="w-3.5 h-3.5" /> Back to Portal
+            </Link>
+            <button
+              onClick={() => { signOut(); router.push("/login"); }}
+              className="text-sm font-medium text-bronze-dark/60 hover:text-charcoal transition-colors"
+            >
+              Sign out
+            </button>
+          </div>
         </div>
 
         {/* Tab switcher */}
@@ -186,6 +269,17 @@ export default function OfficerDashboardPage() {
             <span className="px-2 py-0.5 text-xs rounded-full bg-surface-muted text-charcoal font-bold">
               {drives.length}
             </span>
+          </button>
+          <button
+            onClick={() => setActiveTab("benchmarks")}
+            className={`py-3 border-b-2 transition-colors flex items-center gap-2 ${
+              activeTab === "benchmarks"
+                ? "border-orange text-orange font-bold"
+                : "border-transparent text-bronze-dark/60 hover:text-charcoal"
+            }`}
+          >
+            <GraduationCap className="w-4 h-4" />
+            Skill Benchmarks
           </button>
         </div>
       </header>
@@ -228,6 +322,11 @@ export default function OfficerDashboardPage() {
               </div>
             </div>
 
+            {notice && (
+              <div className={`mb-4 text-sm p-3 rounded-[10px] border font-medium ${notice.ok ? "bg-success-light text-success border-success/20" : "bg-danger-light text-danger border-danger/15"}`}>
+                {notice.text}
+              </div>
+            )}
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
               {/* Pending Queue */}
               <div className="lg:col-span-2 space-y-4">
@@ -246,11 +345,19 @@ export default function OfficerDashboardPage() {
                     {queueData.pending_runs.map((run: any) => (
                       <div
                         key={run.run_id}
-                        className="p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4 hover:bg-surface-warm/50 transition-colors"
+                        className="p-5 flex flex-col sm:flex-row sm:flex-wrap sm:items-center justify-between gap-4 hover:bg-surface-warm/50 transition-colors"
                       >
                         <div>
                           <div className="flex items-center gap-2 mb-1 flex-wrap">
-                            <span className="font-semibold text-charcoal">{run.student_id}</span>
+                            <span className="font-semibold text-charcoal">{run.student_name || run.student_id}</span>
+                            {run.target_roles?.length > 0 && (
+                              <span className="text-[11px] text-bronze-dark/60">{run.target_roles.join(", ")}</span>
+                            )}
+                            {run.warnings?.length > 0 && (
+                              <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-warning-light text-warning border border-warning/20">
+                                Needs override: {run.warnings.join(", ").replace(/_/g, " ").toLowerCase()}
+                              </span>
+                            )}
                             <PBBadge variant="high">
                               <Clock className="w-3 h-3 mr-1" />
                               {run.status.replace("_", " ")}
@@ -272,11 +379,9 @@ export default function OfficerDashboardPage() {
                         </div>
 
                         <div className="flex gap-2">
-                          <Link href={`/assessment/${run.run_id}`} target="_blank">
-                            <PBButton variant="secondary" size="sm">
-                              View Report
-                            </PBButton>
-                          </Link>
+                          <PBButton variant="secondary" size="sm" onClick={() => toggleReport(run.run_id)}>
+                            {openPanel?.runId === run.run_id && openPanel?.kind === "report" ? "Hide Report" : "View Report"}
+                          </PBButton>
                           <PBButton
                             variant="primary"
                             size="sm"
@@ -302,7 +407,54 @@ export default function OfficerDashboardPage() {
                               "Reject"
                             )}
                           </PBButton>
+                          <PBButton variant="secondary" size="sm"
+                            onClick={() => setOpenPanel(openPanel?.runId === run.run_id && openPanel?.kind === "edit" ? null : { runId: run.run_id, kind: "edit" })}>
+                            Edit
+                          </PBButton>
+                          {run.warnings?.length > 0 && (
+                            <PBButton variant="outline" size="sm"
+                              onClick={() => setOpenPanel(openPanel?.runId === run.run_id && openPanel?.kind === "override" ? null : { runId: run.run_id, kind: "override" })}>
+                              Override
+                            </PBButton>
+                          )}
                         </div>
+                        {openPanel?.runId === run.run_id && openPanel?.kind === "edit" && (
+                          <div className="w-full space-y-2 pt-2">
+                            <textarea value={note} onChange={e => setNote(e.target.value)} rows={2}
+                              placeholder="Reviewer note shown to the student"
+                              className="w-full px-3 py-2 text-sm bg-surface border border-border-default rounded-[10px]" />
+                            {run.gaps?.length > 0 && (
+                              <div className="flex gap-2">
+                                <select value={gapSkill} onChange={e => setGapSkill(e.target.value)}
+                                  className="px-3 py-2 text-sm bg-surface border border-border-default rounded-[10px]">
+                                  <option value="">Rewrite a gap recommendation…</option>
+                                  {run.gaps.map((g: string) => <option key={g} value={g}>{g}</option>)}
+                                </select>
+                                <input value={gapText} onChange={e => setGapText(e.target.value)} disabled={!gapSkill}
+                                  placeholder="New recommendation (mention the skill)"
+                                  className="flex-1 px-3 py-2 text-sm bg-surface border border-border-default rounded-[10px]" />
+                              </div>
+                            )}
+                            <PBButton size="sm" onClick={() => handleEdit(run.run_id)}
+                              disabled={actionLoading === run.run_id || (!note.trim() && !(gapSkill && gapText.trim()))}>
+                              Save edit
+                            </PBButton>
+                          </div>
+                        )}
+                        {openPanel?.runId === run.run_id && openPanel?.kind === "report" && (
+                          report ? <RunReport report={report} /> : <Loader2 className="w-4 h-4 animate-spin text-bronze" />
+                        )}
+                        {openPanel?.runId === run.run_id && openPanel?.kind === "override" && (
+                          <div className="w-full space-y-2 pt-2">
+                            <textarea value={reason} onChange={e => setReason(e.target.value)} rows={2}
+                              placeholder="Reason for publishing despite the warnings (at least 20 characters)"
+                              className="w-full px-3 py-2 text-sm bg-surface border border-border-default rounded-[10px]" />
+                            <PBButton size="sm" onClick={() => handleOverride(run.run_id)}
+                              disabled={actionLoading === run.run_id || reason.trim().length < 20}>
+                              Override & publish
+                            </PBButton>
+                          </div>
+                        )}
                       </div>
                     ))}
                   </div>
@@ -326,10 +478,18 @@ export default function OfficerDashboardPage() {
                             {decision.decided_at ? new Date(decision.decided_at).toLocaleTimeString() : "Recently"}
                           </p>
                         </div>
-                        {decision.decision === "APPROVED" ? (
-                          <span className="flex items-center gap-1 text-xs text-success font-semibold">
-                            <CheckCircle className="w-3.5 h-3.5" /> Approved
+                        {decision.decision === "APPROVED" || decision.decision === "OVERRIDE" ? (
+                          <span className="flex items-center gap-2 text-xs text-success font-semibold">
+                            <CheckCircle className="w-3.5 h-3.5" /> {decision.decision === "OVERRIDE" ? "Overridden" : "Approved"}
+                            {decision.rollback_to_version_id && (
+                              <button onClick={() => handleRollback(decision.rollback_to_version_id)}
+                                className="text-bronze-dark underline font-medium">
+                                Roll back
+                              </button>
+                            )}
                           </span>
+                        ) : decision.decision === "EDITED" ? (
+                          <span className="text-xs text-bronze-dark font-semibold">Edited</span>
                         ) : (
                           <span className="flex items-center gap-1 text-xs text-danger font-semibold">
                             <XCircle className="w-3.5 h-3.5" /> Rejected
@@ -511,6 +671,7 @@ export default function OfficerDashboardPage() {
             )}
           </div>
         )}
+        {activeTab === "benchmarks" && <BenchmarkEditor />}
       </main>
 
       {/* Modals */}

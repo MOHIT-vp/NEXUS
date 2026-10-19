@@ -5,7 +5,6 @@ import { useRouter } from "next/navigation";
 import {
   AlertTriangle,
   TrendingUp,
-  BookOpen,
   Building2,
   Award,
   ArrowRight,
@@ -25,10 +24,12 @@ import { ScoreGauge } from "@/components/ui/score-gauge";
 import { PBBadge } from "@/components/ui/pb-badge";
 import { PBButton } from "@/components/ui/pb-button";
 import { Loader } from "@/components/ui/loader";
-import { getDashboardByRunId, listRecruitmentDrives, JobDrive } from "@/lib/api";
+import { findMyRunId, getActiveRunId, getDashboardByRunId, getSessionUser, listRecruitmentDrives, JobDrive } from "@/lib/api";
 import { PreparednessModal } from "@/components/companies/preparedness-modal";
 import { CodingPractice } from "@/components/coding/coding-practice";
 import { ResumePerfectionCard } from "@/components/resume/resume-perfection-card";
+import { RoadmapPath, type RoadmapMeta } from "@/components/roadmap/roadmap-path";
+import { MockInterview } from "@/components/mock/mock-interview";
 
 type CompanyMatch = {
   job_id?: string;
@@ -46,6 +47,11 @@ type RoadmapItem = {
   skill: string;
   action: string;
   resource: string;
+  resource_url?: string | null;
+  current_level?: string | null;
+  target_level?: string | null;
+  importance?: string | null;
+  milestone?: string | null;
   estimated_hours: number;
   priority: string;
 };
@@ -61,6 +67,7 @@ type DashboardData = {
   company_matches: CompanyMatch[];
   top_companies: CompanyMatch[];
   roadmap: RoadmapItem[];
+  roadmap_meta?: RoadmapMeta;
   profile: {
     skills: { name: string; proficiency: string }[];
     projects: { title: string; description: string; technologies: string[] }[];
@@ -83,12 +90,22 @@ type DashboardData = {
   };
 };
 
-const PRIORITY_MAP: Record<string, { variant: "critical" | "high" | "medium" | "low"; label: string }> = {
-  critical: { variant: "critical", label: "Critical" },
-  high: { variant: "high", label: "High" },
-  medium: { variant: "medium", label: "Medium" },
-  low: { variant: "low", label: "Low" },
-};
+/** Export the published roadmap as a plain-text file the student can keep or print. */
+function downloadRoadmap(items: RoadmapItem[]) {
+  const lines = ["Learning roadmap", ""];
+  items.forEach((item, i) => {
+    lines.push(`${i + 1}. Week ${item.week} — ${item.action} [${item.priority}]`);
+    lines.push(`   Skill: ${item.skill}`);
+    if (item.resource) lines.push(`   Resource: ${item.resource}${item.resource_url ? ` (${item.resource_url})` : ""}`);
+    lines.push("");
+  });
+  const url = URL.createObjectURL(new Blob([lines.join("\n")], { type: "text/plain" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "learning-roadmap.txt";
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 function BreakdownBar({ label, pts, max }: { label: string; pts: number; max: number }) {
   const pct = (pts / max) * 100;
@@ -184,16 +201,21 @@ export default function DashboardPage() {
   const [companySubTab, setCompanySubTab] = useState<"drives" | "matches">("drives");
 
   useEffect(() => {
-    const runId = localStorage.getItem("active_run_id");
-    setActiveRunId(runId);
-
-    if (!runId) {
-      router.replace("/onboarding");
+    const user = getSessionUser();
+    if (!user || user.role !== "student") {
+      router.replace(user ? "/" : "/login?next=/dashboard");
       return;
     }
 
     const fetchData = async () => {
       try {
+        // Ask the server which plan is current (a newer plan may have been published)
+        const runId = await findMyRunId().catch(() => getActiveRunId());
+        setActiveRunId(runId);
+        if (!runId) {
+          router.replace("/onboarding");
+          return;
+        }
         const dashboardData = await getDashboardByRunId(runId);
 
         if (dashboardData.status === "published" || dashboardData.has_approved_plan) {
@@ -383,7 +405,7 @@ export default function DashboardPage() {
 
           {/* ── Mobile Tab Selector ── */}
           <div className="flex gap-1 p-1 bg-surface-muted rounded-[12px] lg:hidden overflow-x-auto">
-            {["overview", "perfection", "companies", "roadmap", "skills", "coding"].map(tab => (
+            {["overview", "perfection", "companies", "roadmap", "mock", "skills", "coding"].map(tab => (
               <button
                 key={tab}
                 onClick={() => setActiveTab(tab)}
@@ -391,7 +413,7 @@ export default function DashboardPage() {
                   activeTab === tab ? "bg-surface text-charcoal shadow-xs" : "text-bronze-dark/50"
                 }`}
               >
-                {tab === "perfection" ? "Resume Perfection" : tab === "companies" ? "Recruitment & Companies" : tab === "coding" ? "Code Practice" : tab}
+                {tab === "perfection" ? "Resume Perfection" : tab === "companies" ? "Recruitment & Companies" : tab === "coding" ? "Code Practice" : tab === "mock" ? "Mock Interview" : tab}
               </button>
             ))}
           </div>
@@ -813,11 +835,6 @@ export default function DashboardPage() {
           ═══════════════════════════════════════════ */}
           {activeTab === "roadmap" && (
             <div className="animate-fade-in">
-              <div className="mb-6">
-                <h2 className="type-h2 mb-1">Your learning roadmap.</h2>
-                <p className="type-body text-bronze-dark/50">A structured plan to close your skill gaps and strengthen your placement readiness.</p>
-              </div>
-
               {roadmap.length === 0 ? (
                 <div className="surface-card p-12 text-center">
                   <div className="w-12 h-12 rounded-[14px] bg-success-light flex items-center justify-center mx-auto mb-4">
@@ -827,32 +844,7 @@ export default function DashboardPage() {
                   <p className="text-sm text-bronze-dark/50 mt-1">No critical skill gaps were identified from your resume.</p>
                 </div>
               ) : (
-                <div className="space-y-3">
-                  {roadmap.map((item, i) => {
-                    const priority = PRIORITY_MAP[item.priority] || PRIORITY_MAP.low;
-                    return (
-                      <div key={i} className="surface-card p-5 flex items-start gap-5 hover-lift">
-                        <div className="w-10 h-10 rounded-full bg-earth flex items-center justify-center text-ivory text-sm font-bold shrink-0">
-                          W{item.week}
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center gap-2 flex-wrap mb-1">
-                            <h3 className="font-semibold text-charcoal">{item.action}</h3>
-                            <PBBadge variant={priority.variant}>{priority.label}</PBBadge>
-                          </div>
-                          <p className="text-sm text-bronze flex items-center gap-1.5">
-                            <BookOpen className="w-3.5 h-3.5 shrink-0" />
-                            {item.resource}
-                          </p>
-                          <p className="text-xs text-bronze-dark/40 mt-1">~{item.estimated_hours} hours estimated</p>
-                        </div>
-                        <div className="text-right text-xs text-bronze-dark/40 shrink-0 hidden sm:block">
-                          <TrendingUp className="w-3.5 h-3.5 inline mb-0.5" /> <span className="font-semibold capitalize">{item.skill}</span>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
+                <RoadmapPath steps={roadmap} meta={data.roadmap_meta} onDownload={() => downloadRoadmap(roadmap)} />
               )}
             </div>
           )}
@@ -922,6 +914,8 @@ export default function DashboardPage() {
           {activeTab === "coding" && (
             <CodingPractice />
           )}
+
+          {activeTab === "mock" && <MockInterview />}
         </main>
       </div>
 

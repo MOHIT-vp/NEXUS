@@ -30,7 +30,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     expire = datetime.now(timezone.utc) + (
         expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     )
-    to_encode.update({"exp": expire, "type": "access"})
+    to_encode.update({"exp": expire, "type": "access", "jti": uuid.uuid4().hex})
     return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 
@@ -38,8 +38,26 @@ def create_refresh_token(data: dict) -> str:
     """Create a JWT refresh token."""
     to_encode = data.copy()
     expire = datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
-    to_encode.update({"exp": expire, "type": "refresh"})
+    to_encode.update({"exp": expire, "type": "refresh", "jti": uuid.uuid4().hex})
     return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+
+async def is_revoked(db: AsyncSession, payload: dict) -> bool:
+    """True when the token was signed out (server-side revocation list)."""
+    from app.models.user import RevokedToken
+    jti = payload.get("jti")
+    if not jti:
+        return False
+    return (await db.execute(select(RevokedToken.jti).where(RevokedToken.jti == jti))).first() is not None
+
+
+async def revoke(db: AsyncSession, payload: Optional[dict]) -> None:
+    """Add a token to the revocation list (idempotent)."""
+    from app.models.user import RevokedToken
+    if not payload or not payload.get("jti") or await is_revoked(db, payload):
+        return
+    db.add(RevokedToken(jti=payload["jti"], user_id=uuid.UUID(payload["sub"]),
+                        expires_at=datetime.fromtimestamp(payload["exp"], tz=timezone.utc)))
 
 
 def decode_token(token: str) -> Optional[dict]:
@@ -92,6 +110,10 @@ async def create_user(
     return user
 
 
+class InactiveAccountError(Exception):
+    """Correct password, but the account is not active (awaiting approval or deactivated)."""
+
+
 async def authenticate_user(db: AsyncSession, email: str, password: str) -> Optional[User]:
     """Authenticate a user by email and password."""
     user = await get_user_by_email(db, email)
@@ -100,5 +122,5 @@ async def authenticate_user(db: AsyncSession, email: str, password: str) -> Opti
     if not verify_password(password, user.password_hash):
         return None
     if not user.is_active:
-        return None
+        raise InactiveAccountError()
     return user

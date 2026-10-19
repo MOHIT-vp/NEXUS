@@ -38,10 +38,25 @@ def test_diagnose_eligibility_failure():
 # ---------------------------------------------------------------------------
 
 def test_diagnose_evidence_failure():
-    """EVIDENCE_PRESENT failure must map to evidence_grounding."""
-    from app.agents.validation_agent import FAILURE_TO_AGENT_MAP
-    target = FAILURE_TO_AGENT_MAP.get("EVIDENCE_PRESENT")
-    assert target == "evidence_grounding"
+    """EVIDENCE_PRESENT and CONSENT_SATISFIED are not self-healable: they escalate to the human."""
+    from app.agents.validation_agent import FAILURE_TO_AGENT_MAP, _diagnose_failures
+    assert FAILURE_TO_AGENT_MAP.get("EVIDENCE_PRESENT") is None
+    diag = _diagnose_failures([
+        {"code": "EVIDENCE_PRESENT", "passed": False, "severity": "error", "name": "x", "message": "y"},
+        {"code": "CONSENT_SATISFIED", "passed": False, "severity": "error", "name": "x", "message": "y"},
+    ])
+    assert diag["can_self_heal"] is False
+    assert set(diag["unresolvable"]) == {"EVIDENCE_PRESENT", "CONSENT_SATISFIED"}
+
+
+def test_unhealable_failure_escalates_immediately():
+    """validation_route must not burn retries on failures no agent can fix."""
+    from app.agents.self_healing import validation_route
+    state = {
+        "validation_passed": False, "retry_count": 0, "max_retries": 3, "budget_remaining": 100000,
+        "validation_report": {"diagnosis": {"can_self_heal": False, "agents_to_regenerate": []}},
+    }
+    assert validation_route(state) == "fail_escalate"
 
 
 # ---------------------------------------------------------------------------

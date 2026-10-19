@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import {
   UploadCloud, CheckCircle2, ChevronRight, Code2,
@@ -11,7 +11,7 @@ import { PBInput } from "@/components/ui/pb-input";
 import { Navbar } from "@/components/navigation/navbar";
 import { cn } from "@/lib/utils";
 import Link from "next/link";
-import { uploadResume } from "@/lib/api";
+import { uploadResume, getSessionUser, setActiveRunId, grantConsent, clarifyPlan, type ConsentSource, type PlannerResponse } from "@/lib/api";
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
 type ValidationState = "idle" | "checking" | "valid" | "invalid";
@@ -61,7 +61,42 @@ export default function OnboardingPage() {
   const [githubUser, setGithubUser] = useState<{ login: string; avatar_url: string; public_repos: number } | null>(null);
   const [codingSolved, setCodingSolved] = useState("");
   const [cgpa, setCgpa] = useState("");
-  const [consent, setConsent] = useState(false);
+  // One consent per data source (stored in the Consent table on submit)
+  const [consents, setConsents] = useState<Record<ConsentSource, boolean>>({
+    resume_processing: false, github: false, leetcode: false, academic_records: false,
+  });
+  const consent = consents.resume_processing;
+
+  // Career goal + clarifying questions
+  const [goal, setGoal] = useState("");
+  const [planner, setPlanner] = useState<PlannerResponse | null>(null);
+  const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [feedback, setFeedback] = useState("");
+  const [planLoading, setPlanLoading] = useState(false);
+  const [planError, setPlanError] = useState("");
+
+  // Only signed-in students can submit a resume
+  useEffect(() => {
+    const user = getSessionUser();
+    if (!user) router.replace("/login?next=/onboarding");
+    else if (user.role !== "student") router.replace("/officer");
+  }, [router]);
+
+  async function askPlanner(extra: { answers?: Record<string, string>; feedback?: string } = {}) {
+    if (!goal.trim()) { setPlanError("Describe your goal first."); return; }
+    setPlanLoading(true); setPlanError("");
+    try {
+      const res = await clarifyPlan({ request: goal.trim(), slots: planner?.slots ?? null, ...extra });
+      setPlanner(res);
+      setAnswers({});
+      if (extra.feedback) setFeedback("");
+      if (res.message) setPlanError(res.message);
+    } catch (err) {
+      setPlanError(err instanceof Error ? err.message : "Could not build a plan.");
+    } finally {
+      setPlanLoading(false);
+    }
+  }
 
   const ALLOWED = [
     "application/pdf",
@@ -128,8 +163,14 @@ export default function OnboardingPage() {
     }, 4500); // advance every 4.5 seconds
 
     try {
+      // Record each consent the student ticked, then upload
+      for (const source of Object.keys(consents) as ConsentSource[]) {
+        if (consents[source]) await grantConsent(source);
+      }
       const form = new FormData();
       form.append("file", resumeFile);
+      form.append("target_roles", JSON.stringify(planner?.plan?.target_roles ?? []));
+      if (planner?.plan) form.append("career_plan", JSON.stringify(planner.plan));
       if (leetcode.trim()) form.append("leetcode_handle", leetcode.trim());
       if (github.trim()) form.append("github_username", github.trim());
       if (codingSolved) form.append("coding_solved", codingSolved);
@@ -143,7 +184,7 @@ export default function OnboardingPage() {
       setProgress("Initializing your assessment tracker...");
 
       // Save the active run ID for convenience (Dashboard will check this)
-      localStorage.setItem("active_run_id", data.run_id);
+      setActiveRunId(data.run_id);
       
       // Redirect to the assessment status page
       router.push(`/assessment/${data.run_id}`);
@@ -157,7 +198,7 @@ export default function OnboardingPage() {
     }
   }
 
-  const canSubmit = consent && !!resumeFile && (githubState === "valid" || !github.trim()) && !isSubmitting;
+  const canSubmit = consent && !!planner?.plan && !!resumeFile && (githubState === "valid" || !github.trim()) && !isSubmitting;
 
   return (
     <div className="min-h-screen bg-ivory flex flex-col">
@@ -279,6 +320,84 @@ export default function OnboardingPage() {
                   </p>
                 </div>
 
+                {/* Career Goal — clarifying questions and plan */}
+                <div className="space-y-4">
+                  <p className="type-micro text-bronze">CAREER GOAL</p>
+                  <div className="flex gap-2">
+                    <div className="flex-1">
+                      <PBInput
+                        label="What are you preparing for?"
+                        placeholder="e.g. Help me get a data analyst job in 3 months"
+                        value={goal}
+                        onChange={e => { setGoal(e.target.value); setPlanner(null); }}
+                      />
+                    </div>
+                    <PBButton type="button" variant="secondary" onClick={() => askPlanner()} disabled={planLoading || !goal.trim()}>
+                      {planLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : "Plan"}
+                    </PBButton>
+                  </div>
+
+                  {planner?.status === "needs_clarification" && (
+                    <div className="p-4 bg-surface-warm rounded-[12px] border border-border-subtle space-y-3">
+                      <p className="text-sm font-semibold text-charcoal">A few quick questions</p>
+                      {planner.questions.map(q => (
+                        <div key={q.id}>
+                          <label className="block text-xs font-semibold text-charcoal mb-1">{q.question}</label>
+                          {q.options.length > 0 ? (
+                            <select
+                              value={answers[q.id] ?? ""}
+                              onChange={e => setAnswers({ ...answers, [q.id]: e.target.value })}
+                              className="w-full px-3 py-2 text-sm bg-surface border border-border-default rounded-[10px]"
+                            >
+                              <option value="">Choose…</option>
+                              {q.options.map(o => <option key={o} value={o}>{o}</option>)}
+                            </select>
+                          ) : (
+                            <input
+                              value={answers[q.id] ?? ""}
+                              placeholder={q.help}
+                              onChange={e => setAnswers({ ...answers, [q.id]: e.target.value })}
+                              className="w-full px-3 py-2 text-sm bg-surface border border-border-default rounded-[10px]"
+                            />
+                          )}
+                        </div>
+                      ))}
+                      <PBButton type="button" size="sm" onClick={() => askPlanner({ answers })}
+                        disabled={planLoading || planner.questions.some(q => !answers[q.id])}>
+                        Save answers
+                      </PBButton>
+                    </div>
+                  )}
+
+                  {planner?.status === "draft_ready" && planner.plan && (
+                    <div className="p-4 bg-success-light/30 rounded-[12px] border border-success/20 space-y-2">
+                      <p className="text-sm font-semibold text-charcoal">
+                        Plan: {planner.plan.target_role_details.map(t => t.title).join(", ")} · {planner.plan.skill_level} · {planner.plan.timeline_weeks} weeks
+                      </p>
+                      <ul className="text-xs text-bronze-dark/70 space-y-1">
+                        {planner.plan.steps.map(st => <li key={st.phase}>{st.weeks}: {st.title}</li>)}
+                      </ul>
+                      {planner.changes && planner.changes.length > 0 && (
+                        <p className="text-xs text-success font-medium">Updated: {planner.changes.join("; ")}</p>
+                      )}
+                      <div className="flex gap-2 pt-1">
+                        <input
+                          value={feedback}
+                          onChange={e => setFeedback(e.target.value)}
+                          placeholder="Change something, e.g. 'switch to backend developer, 8 weeks'"
+                          className="flex-1 px-3 py-2 text-sm bg-surface border border-border-default rounded-[10px]"
+                        />
+                        <PBButton type="button" size="sm" variant="secondary"
+                          onClick={() => askPlanner({ feedback })} disabled={planLoading || !feedback.trim()}>
+                          Revise
+                        </PBButton>
+                      </div>
+                    </div>
+                  )}
+
+                  {planError && <p className="text-sm text-danger font-medium">{planError}</p>}
+                </div>
+
                 {/* Coding Profile */}
                 <div className="space-y-4">
                   <p className="type-micro text-bronze">CODING PROFILE</p>
@@ -367,24 +486,28 @@ export default function OnboardingPage() {
                   </div>
                 </div>
 
-                {/* Consent */}
-                <div className="flex items-start gap-3 p-4 bg-surface-warm rounded-[12px] border border-border-subtle">
-                  <input
-                    type="checkbox"
-                    id="consent"
-                    required
-                    checked={consent}
-                    onChange={e => setConsent(e.target.checked)}
-                    className="w-4.5 h-4.5 mt-0.5 rounded border-border-strong text-charcoal focus:ring-charcoal/30 cursor-pointer accent-charcoal"
-                  />
-                  <div>
-                    <label htmlFor="consent" className="text-sm font-semibold text-charcoal cursor-pointer">
-                      I consent to data analysis
+                {/* Consent — one per data source */}
+                <div className="p-4 bg-surface-warm rounded-[12px] border border-border-subtle space-y-3">
+                  <p className="text-sm font-semibold text-charcoal">Consent</p>
+                  {([
+                    ["resume_processing", "Analyse my uploaded resume (required)", true],
+                    ["github", "Read my public GitHub profile", !!github.trim()],
+                    ["leetcode", "Read my public LeetCode profile", !!leetcode.trim()],
+                    ["academic_records", "Use my CGPA for company eligibility", !!cgpa],
+                  ] as [ConsentSource, string, boolean][]).filter(([, , show]) => show).map(([key, label]) => (
+                    <label key={key} className="flex items-start gap-3 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={consents[key]}
+                        onChange={e => setConsents({ ...consents, [key]: e.target.checked })}
+                        className="w-4.5 h-4.5 mt-0.5 rounded border-border-strong accent-charcoal cursor-pointer"
+                      />
+                      <span className="text-sm text-charcoal">{label}</span>
                     </label>
-                    <p className="text-xs text-bronze-dark/50 mt-1 leading-relaxed">
-                      I authorise the Placement Readiness Portal to analyse my resume and coding profiles. Data is processed locally and not stored in any database.
-                    </p>
-                  </div>
+                  ))}
+                  <p className="text-xs text-bronze-dark/50 leading-relaxed">
+                    Each source is used only if you tick it. Your plan is reviewed by the Placement Cell before you see it.
+                  </p>
                 </div>
 
                 {submitError && (

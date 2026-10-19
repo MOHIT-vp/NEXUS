@@ -44,8 +44,10 @@ class PlacementState(TypedDict):
     student_id: str
     
     # User Request Input
-    request_context: Optional[str]
+    request_context: Optional[Any]          # clarified request (planner session output)
     target_roles: List[str]
+    resume_id: Optional[str]
+    platform_handles: Optional[Dict[str, Optional[str]]]   # {'github': ..., 'leetcode': ...}
     
     # Plan
     plan: Optional[ExecutionPlan]
@@ -59,9 +61,16 @@ class PlacementState(TypedDict):
     matching_result: Optional[Dict[str, Any]]
     interview_result: Optional[Dict[str, Any]]
     roadmap: Optional[Dict[str, Any]]
-    
+    student_context: Optional[Dict[str, Any]]      # career prefs + consented academic data
+    role_requirements: Optional[List[Dict[str, Any]]]
+    specialist_analysis: Optional[Dict[str, Any]]  # Lab 13 domain specialists
+    retrieval: Optional[Dict[str, Any]]            # Lab 4 retrieved evidence + citations
+    validation_report: Optional[Dict[str, Any]]
+    draft: Optional[Dict[str, Any]]                # Lab 15: the assembled draft, carried to review
+
     # Internal state
     consent_validated: bool
+    consent_status: Optional[Dict[str, Any]]
     evidence_records: Annotated[List[Dict[str, Any]], append_items]
     
     # Validation & Approval
@@ -76,6 +85,9 @@ class PlacementState(TypedDict):
     next_node: str
     healing_target: Optional[str]  # Lab 10: which agent to re-run during self-healing
     
+    # Inputs the pipeline needs to finish the run (kept in the checkpoint so a resumed run has them)
+    run_inputs: Optional[Dict[str, Any]]
+
     # System
     errors: Annotated[List[str], append_items]
     audit_events: Annotated[List[AuditEvent], append_items]

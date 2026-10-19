@@ -1,115 +1,75 @@
 """
 Tests for Company Listing by Placement Cell and Student Preparedness & Skill Match Feature.
 """
+import uuid
+
 import pytest
 from pydantic import ValidationError
 from app.schemas.company import CompanyCreate, CompanyUpdate, PreparednessCheckRequest
 from app.services.company_service import company_service, CompanyService
 
 
+def as_drive(payload: CompanyCreate) -> dict:
+    """A drive dict in the shape the preparedness engine reads (as built from the database)."""
+    d = payload.model_dump()
+    d.update(job_id=str(uuid.uuid4()), company_id=str(uuid.uuid4()), company_name=d.pop("name"),
+             selection_rounds=d.get("selection_rounds") or [])
+    return d
+
+
 class TestCompanyListingAndManagement:
-    """Tests for Placement Cell listing and managing recruitment drives."""
+    """Drives live in the database (companies, jobs, role_skills)."""
 
-    def test_list_initial_drives(self):
-        """Initial seed drives should be present and valid."""
-        drives = company_service.list_drives()
-        assert len(drives) >= 5
-        job_titles = [d.role_title for d in drives]
-        assert "Software Engineer" in job_titles
-        assert "Data Engineer" in job_titles
+    @pytest.fixture
+    async def seeded(self, db_factory):
+        from scripts.seed_sample_drives import seed
+        async with db_factory() as db:
+            assert await seed(db) == 5
+            assert await seed(db) == 0          # idempotent
+        return db_factory
 
-    def test_search_drives_by_company_name(self):
-        """Search by company name filter."""
-        drives = company_service.list_drives(search="TechCorp")
-        assert len(drives) >= 1
-        assert "TechCorp" in drives[0].company_name
+    async def test_list_and_search_drives(self, seeded):
+        from app.services import drive_repository as repo
+        async with seeded() as db:
+            drives = await repo.list_drives(db)
+            titles = [d["role_title"] for d in drives]
+            assert len(drives) == 5 and "Software Engineer" in titles and "Data Engineer" in titles
+            assert all(d["description"].startswith("[Sample company]") for d in drives)
+            assert "TechCorp" in (await repo.list_drives(db, search="TechCorp"))[0]["company_name"]
+            for d in await repo.list_drives(db, search="Docker"):
+                assert any("docker" in s.lower() for s in d["required_skills"] + d["preferred_skills"])
+            assert all(d["role_family"] == "devops" for d in await repo.list_drives(db, role_family="devops"))
 
-    def test_search_drives_by_skill(self):
-        """Search by skill keyword."""
-        drives = company_service.list_drives(search="Docker")
-        assert len(drives) >= 1
-        for d in drives:
-            all_skills = d.required_skills + d.preferred_skills
-            assert any("docker" in s.lower() for s in all_skills)
+    async def test_sample_drives_are_matched_by_the_job_agent(self, seeded):
+        from app.connectors.job_connector import JobConnector
+        async with seeded() as db:
+            jobs = await JobConnector(db).list_active_jobs()
+            assert len(jobs) == 5 and all(j["required_skills"] for j in jobs)
 
-    def test_filter_drives_by_role_family(self):
-        """Filter by role family (e.g. devops, data_engineering)."""
-        drives = company_service.list_drives(role_family="devops")
-        assert len(drives) >= 1
-        for d in drives:
-            assert d.role_family == "devops"
+    async def test_create_update_delete_persist(self, db_factory):
+        from app.connectors.job_connector import JobConnector
+        from app.services import drive_repository as repo
+        async with db_factory() as db:
+            created = await repo.create_drive(db, CompanyCreate(
+                name="Google", role_title="Software Engineer", package_lpa=32.0, min_cgpa=8.5,
+                required_skills=["Python", "Algorithms"], preferred_skills=["Kubernetes"], drive_date="2026-12-15"))
+            assert created["required_skills"] == ["Python", "Algorithms"]
+            updated = await repo.update_drive(db, created["job_id"], CompanyUpdate(package_lpa=35.0, status="active"))
+            assert updated["package_lpa"] == 35.0 and updated["status"] == "active"
+        async with db_factory() as db:   # a new session = survives a restart
+            assert (await repo.get_job(db, created["job_id"])) is not None
+            assert await repo.deactivate_drive(db, created["job_id"])
+        async with db_factory() as db:
+            assert await repo.get_job(db, created["job_id"]) is None
+            assert await JobConnector(db).list_active_jobs() == []
 
-    def test_placement_cell_create_new_company_drive(self):
-        """Placement cell adds a new company coming for campus recruitment."""
-        payload = CompanyCreate(
-            name="Google India",
-            industry="Internet & AI",
-            website="https://careers.google.com",
-            location="Bengaluru, India",
-            description="Recruiting for Campus SWE 2026 Batch",
-            role_title="Software Development Engineer I",
-            role_family="software_engineering",
-            package_lpa=28.5,
-            min_cgpa=8.0,
-            max_backlogs=0,
-            min_experience=0,
-            required_skills=["C++", "Python", "Data Structures", "Algorithms"],
-            preferred_skills=["Distributed Systems", "Cloud Computing"],
-            drive_date="2026-11-15",
-            deadline="2026-11-01",
-            status="upcoming",
-        )
-
-        created = company_service.create_drive(payload)
-        assert created.job_id.startswith("job-")
-        assert created.company_name == "Google India"
-        assert created.package_lpa == 28.5
-        assert created.min_cgpa == 8.0
-        assert created.max_backlogs == 0
-        assert "C++" in created.required_skills
-        assert len(created.selection_rounds) >= 3
-
-        # Verify it appears in search
-        found = company_service.get_drive(created.job_id)
-        assert found is not None
-        assert found.company_name == "Google India"
-
-    def test_placement_cell_update_drive(self):
-        """Placement cell updates drive dates or package."""
-        payload = CompanyCreate(
-            name="Stripe Payments",
-            role_title="Backend Engineer",
-            package_lpa=22.0,
-            min_cgpa=7.5,
-            max_backlogs=1,
-            required_skills=["Python", "SQL"],
-        )
-        created = company_service.create_drive(payload)
-
-        update_payload = CompanyUpdate(
-            package_lpa=24.0,
-            status="active",
-        )
-        updated = company_service.update_drive(created.job_id, update_payload)
-        assert updated is not None
-        assert updated.package_lpa == 24.0
-        assert updated.status == "active"
-
-    def test_placement_cell_delete_drive(self):
-        """Placement cell deletes or closes a drive."""
-        payload = CompanyCreate(
-            name="Temporary Corp",
-            role_title="Intern",
-            package_lpa=6.0,
-            min_cgpa=6.0,
-            required_skills=["Java"],
-        )
-        created = company_service.create_drive(payload)
-        assert company_service.get_drive(created.job_id) is not None
-
-        success = company_service.delete_drive(created.job_id)
-        assert success is True
-        assert company_service.get_drive(created.job_id) is None
+    async def test_closed_or_past_deadline_drives_not_matched(self, db_factory):
+        from app.connectors.job_connector import JobConnector
+        from app.services import drive_repository as repo
+        async with db_factory() as db:
+            await repo.create_drive(db, CompanyCreate(name="Old Co", role_title="SDE", package_lpa=5.0, deadline="2020-01-01"))
+            await repo.create_drive(db, CompanyCreate(name="Shut Co", role_title="SDE", package_lpa=5.0, status="closed"))
+            assert await JobConnector(db).list_active_jobs() == []
 
     def test_company_create_validation_constraints(self):
         """Validation constraints reject invalid packages, out-of-range CGPAs, and clean duplicate skills."""
@@ -142,24 +102,6 @@ class TestCompanyListingAndManagement:
         assert "Python" in drive.required_skills
         assert "SQL" in drive.required_skills
 
-    def test_get_drive_slug_and_case_fallback(self):
-        """get_drive successfully resolves by case-insensitive ID, slug, and ad-hoc fallback."""
-        # Exact seed ID
-        d1 = company_service.get_drive("JOB-001")
-        assert d1 is not None
-        assert d1.company_name == "TechCorp Solutions"
-
-        # Slug / company name match
-        d2 = company_service.get_drive("job-techcorp-solutions")
-        assert d2 is not None
-        assert d2.company_name == "TechCorp Solutions"
-
-        # Ad-hoc drive resolution
-        adhoc = company_service.get_or_create_adhoc_drive("job-netflix-streaming", "Netflix")
-        assert adhoc is not None
-        assert adhoc.company_name == "Netflix"
-        assert len(adhoc.required_skills) > 0
-
 
 class TestStudentPreparednessAndSkillMatch:
     """Tests for student preparedness check and skill matching with company requirements."""
@@ -178,7 +120,7 @@ class TestStudentPreparednessAndSkillMatch:
             preferred_skills=["AWS", "Docker", "Terraform"],
             drive_date="2026-11-20",
         )
-        return company_service.create_drive(payload).model_dump()
+        return as_drive(payload)
 
     def test_preparedness_high_match_student(self, sample_drive):
         """Student with all required skills and high CGPA gets a high preparedness score."""
@@ -288,7 +230,8 @@ class TestStudentPreparednessAndSkillMatch:
             min_cgpa=7.0,
             required_skills=["React.js", "Kubernetes", "C++", "AWS"],
             preferred_skills=["Docker"],
-        ).model_dump()
+        )
+        drive = as_drive(drive)
 
         student_profile = {
             "skills": [
@@ -347,7 +290,8 @@ class TestStudentPreparednessAndSkillMatch:
             min_cgpa=7.0,
             required_skills=["Python", "Machine Learning"],
             preferred_skills=["Docker", "Kubernetes"],
-        ).model_dump()
+        )
+        drive = as_drive(drive)
 
         student_profile = {
             "skills": [
@@ -367,127 +311,102 @@ class TestStudentPreparednessAndSkillMatch:
         assert "Docker" in res.prep_roadmap[0]["focus_area"] or "Preferred Skill Edge" in res.prep_roadmap[0]["focus_area"]
 
 
-class TestPlacementCellCohortAnalytics:
-    """Tests for placement cell cohort readiness insights."""
-
-    def test_cohort_readiness_summary(self):
-        """Placement cell can view cohort statistics for a drive."""
-        drives = company_service.list_drives()
-        assert len(drives) > 0
-        job_id = drives[0].job_id
-
-        cohort = company_service.compute_cohort_readiness(job_id)
-        assert cohort.job_id == job_id
-        assert cohort.total_students_evaluated > 0
-        assert 0.0 <= cohort.eligible_percentage <= 100.0
-        assert cohort.average_readiness_score > 0
-        assert isinstance(cohort.common_missing_skills, list)
+async def _publish_plan(db_factory, user_id: str, skills, cgpa=None) -> None:
+    """Store a published readiness plan for a student (what an officer approval produces)."""
+    from sqlalchemy import select
+    from app.models.user import Student
+    from app.models.workflow import Version
+    async with db_factory() as db:
+        student = (await db.execute(select(Student).where(Student.user_id == uuid.UUID(user_id)))).scalar_one()
+        snap = {"student_profile": {"skills": [{"name": n, "proficiency": "advanced"} for n in skills], "projects": []},
+                "student_context": {"academic": {"cgpa": cgpa}} if cgpa is not None else {}}
+        db.add(Version(student_id=student.id, entity_type="readiness_plan", version_number=1, status="published", snapshot=snap))
+        await db.commit()
 
 
-@pytest.mark.asyncio
+NEW_DRIVE = {
+    "name": "Microsoft IDC", "industry": "Cloud & AI", "role_title": "Software Engineer",
+    "role_family": "software_engineering", "package_lpa": 26.0, "min_cgpa": 8.0, "max_backlogs": 0,
+    "min_experience": 0, "required_skills": ["C#", "Azure", "Algorithms", "System Design"],
+    "preferred_skills": ["Kubernetes", "TypeScript"], "drive_date": "2026-11-25",
+}
+
+
 class TestCompanyAPIEndpoints:
-    """Tests for FastAPI HTTP routes."""
+    """Listing needs a signed-in user; managing drives and cohort analytics need the Placement Cell."""
 
-    async def test_api_list_and_check_endpoints(self):
-        """Verify API endpoints respond with 200 and expected JSON structure."""
-        from httpx import AsyncClient, ASGITransport
-        from app.main import app
+    async def test_only_placement_cell_manages_drives(self, client, db_factory):
+        from sqlalchemy import select
+        from app.models.company import Job, RoleSkill
+        from tests.support import create_officer, register_student
 
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            # 1. GET /api/v1/companies
-            resp = await client.get("/api/v1/companies")
-            assert resp.status_code == 200
-            data = resp.json()
-            assert isinstance(data, list)
-            assert len(data) >= 1
+        assert (await client.get("/api/v1/companies")).status_code == 401
+        student = await register_student(client)
+        officer = await create_officer(client, db_factory)
+        assert (await client.post("/api/v1/companies", json=NEW_DRIVE)).status_code == 401
+        assert (await client.post("/api/v1/companies", json=NEW_DRIVE, headers=student["headers"])).status_code == 403
+        created = await client.post("/api/v1/companies", json=NEW_DRIVE, headers=officer["headers"])
+        assert created.status_code == 201
+        job_id = created.json()["job_id"]
 
-            first_job_id = data[0]["job_id"]
+        async with db_factory() as db:
+            job = (await db.execute(select(Job).where(Job.title == "Software Engineer"))).scalar_one()
+            skills = (await db.execute(select(RoleSkill).where(RoleSkill.job_id == job.id))).scalars().all()
+            assert {s.importance for s in skills} == {"required", "preferred"} and len(skills) == 6
 
-            # 2. GET /api/v1/companies/jobs/{job_id}
-            resp_single = await client.get(f"/api/v1/companies/jobs/{first_job_id}")
-            assert resp_single.status_code == 200
-            assert resp_single.json()["job_id"] == first_job_id
+        listed = await client.get("/api/v1/companies", headers=student["headers"])
+        assert [d["job_id"] for d in listed.json()] == [job_id]
+        assert (await client.put(f"/api/v1/companies/jobs/{job_id}", json={"package_lpa": 30.0},
+                                 headers=student["headers"])).status_code == 403
+        put = await client.put(f"/api/v1/companies/jobs/{job_id}", json={"package_lpa": 30.0}, headers=officer["headers"])
+        assert put.status_code == 200 and put.json()["package_lpa"] == 30.0
+        assert (await client.delete(f"/api/v1/companies/jobs/{job_id}", headers=student["headers"])).status_code == 403
+        assert (await client.delete(f"/api/v1/companies/jobs/{job_id}", headers=officer["headers"])).status_code == 204
+        assert (await client.get(f"/api/v1/companies/jobs/{job_id}", headers=student["headers"])).status_code == 404
 
-            # 3. POST /api/v1/companies (Placement Cell creates new company)
-            new_comp = {
-                "name": "Microsoft IDC",
-                "industry": "Cloud & AI",
-                "role_title": "Software Engineer",
-                "role_family": "software_engineering",
-                "package_lpa": 26.0,
-                "min_cgpa": 8.0,
-                "max_backlogs": 0,
-                "min_experience": 0,
-                "required_skills": ["C#", "Azure", "Algorithms", "System Design"],
-                "preferred_skills": ["Kubernetes", "TypeScript"],
-                "drive_date": "2026-11-25",
-            }
-            resp_create = await client.post("/api/v1/companies", json=new_comp)
-            assert resp_create.status_code == 201
-            created_job_id = resp_create.json()["job_id"]
-            assert resp_create.json()["company_name"] == "Microsoft IDC"
+    async def test_preparedness_uses_the_students_own_data(self, client, db_factory):
+        from tests.support import create_officer, register_student
+        officer = await create_officer(client, db_factory)
+        student = await register_student(client)
+        job_id = (await client.post("/api/v1/companies", json=NEW_DRIVE, headers=officer["headers"])).json()["job_id"]
+        url = f"/api/v1/companies/jobs/{job_id}/check-preparedness"
 
-            # 4. POST /api/v1/companies/jobs/{job_id}/check-preparedness (Student checks readiness)
-            check_payload = {
-                "skills": ["Algorithms", "C#", "Data Structures"],
-                "cgpa": 8.5,
-                "backlogs": 0,
-                "coding_solved": 180,
-            }
-            resp_check = await client.post(
-                f"/api/v1/companies/jobs/{created_job_id}/check-preparedness",
-                json=check_payload,
-            )
-            assert resp_check.status_code == 200
-            check_data = resp_check.json()
-            assert check_data["company_name"] == "Microsoft IDC"
-            assert check_data["is_eligible"] is True
-            assert check_data["is_cgpa_eligible"] is True
-            assert check_data["is_backlog_eligible"] is True
-            assert "breakdown" in check_data
-            assert len(check_data["prep_roadmap"]) >= 2
+        # No plan yet and nothing entered: refused instead of scoring a made-up profile
+        none = await client.post(url, json={}, headers=student["headers"])
+        assert none.status_code == 409 and "profile" in none.json()["detail"]
+        # Officers are not students
+        assert (await client.post(url, json={}, headers=officer["headers"])).status_code == 403
 
-            # 5. GET /api/v1/companies/jobs/{job_id}/cohort-readiness (Placement cell checks cohort)
-            resp_cohort = await client.get(f"/api/v1/companies/jobs/{created_job_id}/cohort-readiness")
-            assert resp_cohort.status_code == 200
-            assert "eligible_percentage" in resp_cohort.json()
+        # What-if simulation with explicit input still works, including an explicit empty skill list
+        sim = await client.post(url, json={"skills": ["Algorithms", "C#"], "cgpa": 8.5, "backlogs": 0}, headers=student["headers"])
+        assert sim.status_code == 200 and sim.json()["is_eligible"] is True
+        empty = await client.post(url, json={"skills": [], "cgpa": 8.0}, headers=student["headers"])
+        assert empty.status_code == 200 and empty.json()["breakdown"]["skill_coverage"]["score"] == 0.0
 
-    async def test_api_explicit_empty_skills_not_overwritten(self):
-        """Explicit empty skills list should be evaluated honestly as 0 matched skills, not overwritten with defaults."""
-        from httpx import AsyncClient, ASGITransport
-        from app.main import app
+        # With a published plan the student's own skills and CGPA are used
+        await _publish_plan(db_factory, student["user_id"], ["C#", "Azure", "Algorithms"], cgpa=7.2)
+        own = (await client.post(url, json={}, headers=student["headers"])).json()
+        assert {m["name"] for m in own["matched_skills"]} >= {"C#", "Azure", "Algorithms"}
+        assert own["is_eligible"] is False          # 7.2 is below the 8.0 cutoff
 
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            resp = await client.post(
-                "/api/v1/companies/jobs/job-001/check-preparedness",
-                json={"skills": [], "cgpa": 8.0, "coding_solved": 50},
-            )
-            assert resp.status_code == 200
-            data = resp.json()
-            # Must NOT be populated with default baseline skills
-            assert len(data["matched_skills"]) == 0
-            assert data["breakdown"]["skill_coverage"]["score"] == 0.0
-            assert data["match_tier"] == "Preparation Needed"
+        # Another student's run id is not accepted
+        other = await register_student(client)
+        assert (await client.post(url, json={"run_id": str(uuid.uuid4())}, headers=other["headers"])).status_code == 404
 
-    async def test_api_delete_drive_returns_204(self):
-        """DEL /api/v1/companies/jobs/{job_id} returns 204 No Content cleanly."""
-        from httpx import AsyncClient, ASGITransport
-        from app.main import app
+    async def test_cohort_readiness_uses_published_plans_only(self, client, db_factory):
+        from tests.support import create_officer, register_student
+        officer = await create_officer(client, db_factory)
+        job_id = (await client.post("/api/v1/companies", json=NEW_DRIVE, headers=officer["headers"])).json()["job_id"]
+        url = f"/api/v1/companies/jobs/{job_id}/cohort-readiness"
 
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            # Create a throwaway drive
-            res_create = await client.post(
-                "/api/v1/companies",
-                json={
-                    "name": "Throwaway Inc",
-                    "role_title": "Intern",
-                    "package_lpa": 5.0,
-                },
-            )
-            assert res_create.status_code == 201
-            job_id = res_create.json()["job_id"]
+        empty = await client.get(url, headers=officer["headers"])
+        assert empty.status_code == 200 and empty.json()["total_students_evaluated"] == 0   # no demo cohort
 
-            # Delete it
-            res_del = await client.delete(f"/api/v1/companies/jobs/{job_id}")
-            assert res_del.status_code == 204
-            assert res_del.content == b""
+        a = await register_student(client)
+        b = await register_student(client)
+        await _publish_plan(db_factory, a["user_id"], ["C#", "Azure", "Algorithms", "System Design"], cgpa=8.6)
+        await _publish_plan(db_factory, b["user_id"], ["Python"], cgpa=7.0)
+        assert (await client.get(url, headers=a["headers"])).status_code == 403
+        cohort = (await client.get(url, headers=officer["headers"])).json()
+        assert cohort["total_students_evaluated"] == 2
+        assert 0.0 < cohort["eligible_percentage"] < 100.0

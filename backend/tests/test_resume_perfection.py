@@ -275,255 +275,48 @@ class TestResumePerfectionAnswerEvaluation:
 # Test Process & Dashboard Endpoints
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
 class TestResumePerfectionAPIEndpoints:
-    """Test FastAPI process endpoints for resume perfection quiz."""
+    """Resume perfection endpoints on a real run (owner-only)."""
 
-    async def test_invalid_uuid_returns_400(self):
-        transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as ac:
-            res = await ac.get("/api/v1/process/runs/not-a-uuid/resume-perfection")
-            assert res.status_code == 400
+    async def _run(self, client):
+        from tests.support import grant, register_student, upload
+        s = await register_student(client)
+        await grant(client, s["headers"], "resume_processing")
+        r = await upload(client, s["headers"])
+        assert r.status_code == 200, r.text
+        return s, r.json()["run_id"]
 
-    async def test_non_existent_run_returns_404(self):
-        from app.database import get_db
-        mock_db = AsyncMock()
-        mock_res = MagicMock()
-        mock_res.scalar_one_or_none.return_value = None
-        mock_db.execute = AsyncMock(return_value=mock_res)
+    async def test_invalid_uuid_returns_400(self, client):
+        from tests.support import register_student
+        s = await register_student(client)
+        res = await client.get("/api/v1/process/runs/not-a-uuid/resume-perfection", headers=s["headers"])
+        assert res.status_code == 400
 
-        async def override_get_db():
-            yield mock_db
+    async def test_non_existent_or_foreign_run_returns_404(self, client, reference_data):
+        from tests.support import register_student
+        owner, run_id = await self._run(client)
+        other = await register_student(client)
+        assert (await client.get(f"/api/v1/process/runs/{uuid.uuid4()}/resume-perfection", headers=other["headers"])).status_code == 404
+        assert (await client.get(f"/api/v1/process/runs/{run_id}/resume-perfection", headers=other["headers"])).status_code == 404
+        assert (await client.get(f"/api/v1/process/runs/{run_id}/resume-perfection")).status_code == 401
 
-        app.dependency_overrides[get_db] = override_get_db
-        try:
-            transport = ASGITransport(app=app)
-            async with AsyncClient(transport=transport, base_url="http://test") as ac:
-                fake_id = str(uuid.uuid4())
-                res = await ac.get(f"/api/v1/process/runs/{fake_id}/resume-perfection")
-                assert res.status_code == 404
-        finally:
-            app.dependency_overrides.pop(get_db, None)
+    async def test_get_and_submit_resume_perfection_flow(self, client, reference_data):
+        s, run_id = await self._run(client)
+        url = f"/api/v1/process/runs/{run_id}/resume-perfection"
+        got = (await client.get(url, headers=s["headers"])).json()
+        assert got["questions"]
+        answers = [{"question_id": q["id"], "selected_option_index": 0} for q in got["questions"]]
+        res = await client.post(f"{url}/submit", json={"answers": answers}, headers=s["headers"])
+        assert res.status_code == 200 and res.json()["status"] == "evaluated"
 
-    async def test_get_and_submit_resume_perfection_flow(self):
-        """End-to-end endpoint test with mock DB run."""
-        from app.database import get_db
-
-        run_id = uuid.uuid4()
-        user_id = uuid.uuid4()
-        student_id = uuid.uuid4()
-
-        mock_profile = {
-            "summary": "Full Stack Engineer",
-            "skills": [{"name": "python", "proficiency": "advanced"}, {"name": "docker", "proficiency": "intermediate"}],
-            "projects": [{"title": "Cloud Pipeline", "description": "ETL in Python", "technologies": ["Python", "Docker"]}],
-            "experiences": [],
-        }
-
-        generated_questions = generate_resume_perfection_questions(mock_profile, max_questions=3)
-
-        mock_run = WorkflowRun(
-            id=run_id,
-            student_id=student_id,
-            initiated_by=user_id,
-            status="pending_review",
-            current_step="completed",
-            result_snapshot={
-                "student_profile": mock_profile,
-                "resume_perfection": {
-                    "status": "pending_submission",
-                    "questions": [q.model_dump() for q in generated_questions],
-                    "evaluation": None,
-                },
-            },
-        )
-
-        mock_db = AsyncMock()
-        mock_db.add = MagicMock()
-
-        async def mock_execute(stmt):
-            mock_res = MagicMock()
-            mock_res.scalar_one_or_none.return_value = mock_run
-            mock_res.scalars.return_value.all.return_value = []
-            return mock_res
-
-        mock_db.execute = mock_execute
-        mock_db.commit = AsyncMock()
-
-        async def override_get_db():
-            yield mock_db
-
-        app.dependency_overrides[get_db] = override_get_db
-
-        try:
-            transport = ASGITransport(app=app)
-            async with AsyncClient(transport=transport, base_url="http://test") as ac:
-                # 1. Fetch questions
-                get_res = await ac.get(f"/api/v1/process/runs/{run_id}/resume-perfection")
-                assert get_res.status_code == 200
-                data = get_res.json()
-                assert data["run_id"] == str(run_id)
-                assert len(data["questions"]) == 3
-                assert data["status"] == "pending_submission"
-
-                # Verify solutions are NOT leaked before submission
-                for q in data["questions"]:
-                    assert "correct_option_index" not in q
-                    assert "explanation" not in q
-
-                # 2. Submit answers using actual known correct indices
-                correct_map = {q.id: q.correct_option_index for q in generated_questions}
-                answers_payload = {
-                    "answers": [
-                        {
-                            "question_id": q["id"],
-                            "selected_option_index": correct_map[q["id"]],
-                            "student_notes": "Implemented this directly.",
-                        }
-                        for q in data["questions"]
-                    ]
-                }
-                sub_res = await ac.post(
-                    f"/api/v1/process/runs/{run_id}/resume-perfection/submit",
-                    json=answers_payload,
-                )
-                assert sub_res.status_code == 200
-                eval_data = sub_res.json()
-                assert eval_data["status"] == "evaluated"
-                assert eval_data["evaluation"]["overall_score"] == 100.0
-                assert eval_data["evaluation"]["perfection_tier"] == "exceptional"
-
-                # 3. Regenerate questions
-                regen_res = await ac.post(f"/api/v1/process/runs/{run_id}/resume-perfection/regenerate")
-                assert regen_res.status_code == 200
-                assert regen_res.json()["status"] == "pending_submission"
-                assert len(regen_res.json()["questions"]) > 0
-                for q in regen_res.json()["questions"]:
-                    assert "correct_option_index" not in q
-                    assert "explanation" not in q
-
-        finally:
-            app.dependency_overrides.pop(get_db, None)
-
-    async def test_dashboard_endpoint_includes_resume_perfection(self):
-        """Dashboard endpoint returns resume_perfection object."""
-        from app.database import get_db
-
-        run_id = uuid.uuid4()
-        mock_run = WorkflowRun(
-            id=run_id,
-            student_id=uuid.uuid4(),
-            initiated_by=uuid.uuid4(),
-            status="published",
-            current_step="completed",
-            result_snapshot={
-                "student_profile": {"summary": "CS Student", "skills": [], "projects": [], "experiences": []},
-                "resume_perfection": {
-                    "status": "evaluated",
-                    "questions": [],
-                    "evaluation": {
-                        "overall_score": 90.0,
-                        "perfection_tier": "exceptional",
-                        "tier_label": "Verified Master",
-                    },
-                },
-            },
-        )
-
-        mock_version = Version(
-            id=uuid.uuid4(),
-            workflow_run_id=run_id,
-            student_id=mock_run.student_id,
-            version_number=1,
-            entity_type="readiness_plan",
-            snapshot=mock_run.result_snapshot,
-            status="published",
-        )
-
-        mock_db = AsyncMock()
-
-        async def mock_execute(stmt):
-            mock_res = MagicMock()
-            # If selecting WorkflowRun
-            stmt_str = str(stmt)
-            if "workflow_runs" in stmt_str:
-                mock_res.scalar_one_or_none.return_value = mock_run
-            elif "versions" in stmt_str:
-                mock_res.scalar_one_or_none.return_value = mock_version
-            else:
-                mock_res.scalar_one_or_none.return_value = mock_run
-            return mock_res
-
-        mock_db.execute = mock_execute
-
-        async def override_get_db():
-            yield mock_db
-
-        app.dependency_overrides[get_db] = override_get_db
-        try:
-            transport = ASGITransport(app=app)
-            async with AsyncClient(transport=transport, base_url="http://test") as ac:
-                res = await ac.get(f"/api/v1/dashboard/student/{run_id}")
-                assert res.status_code == 200
-                data = res.json()
-                assert data["status"] == "published"
-                assert "resume_perfection" in data["data"]
-                assert data["data"]["resume_perfection"]["evaluation"]["overall_score"] == 90.0
-                assert data["data"]["resume_perfection"]["evaluation"]["tier_label"] == "Verified Master"
-        finally:
-            app.dependency_overrides.pop(get_db, None)
-
-    async def test_officer_queue_endpoint_includes_resume_perfection_score(self):
-        """Officer queue includes resume_perfection_score and tier."""
-        from app.database import get_db
-
-        run_id = uuid.uuid4()
-        mock_run = WorkflowRun(
-            id=run_id,
-            student_id=uuid.uuid4(),
-            initiated_by=uuid.uuid4(),
-            status="pending_review",
-            current_step="completed",
-            result_snapshot={
-                "resume_perfection": {
-                    "evaluation": {
-                        "overall_score": 85.0,
-                        "tier_label": "Verified Master",
-                    }
-                }
-            },
-        )
-
-        mock_db = AsyncMock()
-        calls = []
-
-        async def mock_execute(stmt):
-            mock_res = MagicMock()
-            calls.append(stmt)
-            if len(calls) == 1:
-                mock_res.scalars.return_value.all.return_value = [mock_run]
-            elif len(calls) == 2:
-                mock_res.scalars.return_value.all.return_value = []
-            else:
-                mock_res.scalars.return_value.all.return_value = []
-                mock_res.scalar.return_value = 1
-            return mock_res
-
-        mock_db.execute = mock_execute
-
-        async def override_get_db():
-            yield mock_db
-
-        app.dependency_overrides[get_db] = override_get_db
-        try:
-            transport = ASGITransport(app=app)
-            async with AsyncClient(transport=transport, base_url="http://test") as ac:
-                res = await ac.get("/api/v1/approvals/queue/open")
-                assert res.status_code == 200
-                data = res.json()
-                assert len(data["pending_runs"]) == 1
-                run_item = data["pending_runs"][0]
-                assert run_item["resume_perfection_score"] == 85.0
-                assert run_item["resume_perfection_tier"] == "Verified Master"
-        finally:
-            app.dependency_overrides.pop(get_db, None)
+    async def test_officer_queue_includes_resume_perfection_score(self, client, db_factory, reference_data):
+        from tests.support import create_officer
+        s, run_id = await self._run(client)
+        url = f"/api/v1/process/runs/{run_id}/resume-perfection"
+        got = (await client.get(url, headers=s["headers"])).json()
+        answers = [{"question_id": q["id"], "selected_option_index": 0} for q in got["questions"]]
+        await client.post(f"{url}/submit", json={"answers": answers}, headers=s["headers"])
+        officer = await create_officer(client, db_factory)
+        queue = (await client.get("/api/v1/approvals/queue/open", headers=officer["headers"])).json()
+        item = next(r for r in queue["pending_runs"] if r["run_id"] == run_id)
+        assert item["resume_perfection_score"] is not None

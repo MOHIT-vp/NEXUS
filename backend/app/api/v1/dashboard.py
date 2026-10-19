@@ -34,6 +34,7 @@ class WorkflowStatusSummary(BaseModel):
 class StudentDashboard(BaseModel):
     student_id: str
     has_approved_plan: bool
+    published_run_id: Optional[str] = None   # run behind the published plan (what the dashboard shows)
     workflow_status: WorkflowStatusSummary
     student_profile: Optional[Dict[str, Any]]
     skill_gap_report: Optional[Dict[str, Any]]
@@ -114,6 +115,7 @@ async def get_student_dashboard(
     return StudentDashboard(
         student_id=str(current_student.id),
         has_approved_plan=True,
+        published_run_id=str(version.workflow_run_id) if version.workflow_run_id else None,
         workflow_status=workflow_status,
         student_profile=snap.get("student_profile"),
         skill_gap_report=snap.get("skill_gap_report"),
@@ -182,10 +184,12 @@ async def get_officer_queue(
 @router.get("/student/{run_id}")
 async def get_student_dashboard_by_run(
     run_id: str,
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    MVP endpoint: fetch dashboard data by run_id without authentication.
+    Dashboard data for one run. Students can open only their own runs;
+    the Placement Cell can open any run.
 
     - If published → returns the full Version snapshot data
     - If pending_review → returns status only (no data)
@@ -201,7 +205,8 @@ async def get_student_dashboard_by_run(
     result = await db.execute(select(WorkflowRun).where(WorkflowRun.id == run_uuid))
     run = result.scalar_one_or_none()
 
-    if not run:
+    from app.api.deps import can_view_run
+    if not run or not await can_view_run(db, current_user, run):
         raise HTTPException(status_code=404, detail="Workflow run not found.")
 
     # If not published yet, return status and any resume perfection quiz data
@@ -242,7 +247,26 @@ async def get_student_dashboard_by_run(
 
         # Build roadmap items
         mapped_roadmap = []
-        if isinstance(roadmap, dict) and "roadmap_items" in roadmap:
+        gap_by_skill = {g.get("skill"): g for g in (skill_gap_report.get("gaps") or [])}
+        if isinstance(roadmap, dict) and roadmap.get("items"):
+            for i, item in enumerate(roadmap["items"]):
+                res = (item.get("resources") or [{}])[0]
+                gap = gap_by_skill.get(item.get("addresses_gap") or item.get("skill")) or {}
+                mapped_roadmap.append({
+                    "current_level": gap.get("current_level"),
+                    "target_level": gap.get("required_level"),
+                    "importance": gap.get("importance"),
+                    "milestone": item.get("milestone"),
+                    "week": i + 1,
+                    "skill": item.get("skill", "Skill"),
+                    "action": item.get("title", "Learn"),
+                    # Show the resource by name (prefix "Skill: " dropped) and link to it
+                    "resource": (res.get("title") or "").split(": ", 1)[-1] or "Ask the Placement Cell for a resource",
+                    "resource_url": res.get("url"),
+                    "estimated_hours": item.get("estimated_hours", 10),
+                    "priority": item.get("priority", "medium"),
+                })
+        elif isinstance(roadmap, dict) and "roadmap_items" in roadmap:
             for i, item in enumerate(roadmap["roadmap_items"]):
                 mapped_roadmap.append({
                     "week": item.get("week", i + 1),
@@ -269,8 +293,15 @@ async def get_student_dashboard_by_run(
                 "missing_skills": m.get("missing_skills", []),
             })
 
-        placement_score = matching_result.get("readiness_score", {}).get("total", 0)
-        score_breakdown = matching_result.get("readiness_score", {})
+        readiness = matching_result.get("readiness_score", {}) or {}
+        placement_score = readiness.get("percentage", readiness.get("total", 0))
+        parts = {b.get("component"): b for b in readiness.get("breakdown", []) if isinstance(b, dict)}
+        score_breakdown = {
+            "skills": (parts.get("skill_coverage") or {}).get("points", 0),
+            "coding": (parts.get("coding_performance") or {}).get("points", 0),
+            "projects": (parts.get("project_relevance") or {}).get("points", 0),
+            "cgpa": 0,
+        }
 
         return {
             "status": "published",
@@ -278,7 +309,8 @@ async def get_student_dashboard_by_run(
             "version_number": version.version_number,
             "published_at": version.published_at.isoformat() if version.published_at else None,
             "data": {
-                "student_name": student_profile.get("summary", "Student").split()[0] if student_profile.get("summary") else "Student",
+                "student_name": current_user.full_name if current_user.role == "student" else "Student",
+                "officer_notes": snapshot.get("officer_notes", []),
                 "github_username": metadata.get("github_username"),
                 "leetcode_handle": metadata.get("leetcode_handle"),
                 "placement_score": placement_score,
@@ -295,6 +327,11 @@ async def get_student_dashboard_by_run(
                 "company_matches": company_matches[:12],
                 "top_companies": company_matches[:5],
                 "roadmap": mapped_roadmap,
+                "roadmap_meta": {
+                    "timeline": roadmap.get("timeline") if isinstance(roadmap, dict) else None,
+                    "timeline_weeks": roadmap.get("timeline_weeks") if isinstance(roadmap, dict) else None,
+                    "total_hours": roadmap.get("total_estimated_hours") if isinstance(roadmap, dict) else None,
+                },
                 "profile": {
                     "skills": student_profile.get("skills", []),
                     "projects": student_profile.get("projects", []),

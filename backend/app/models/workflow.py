@@ -3,10 +3,10 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import (
-    Boolean, Column, DateTime, ForeignKey, Integer, Numeric,
+    Boolean, Column, Computed, DateTime, ForeignKey, Index, Integer, Numeric,
     String, Text,
 )
-from sqlalchemy.dialects.postgresql import UUID, ARRAY, JSONB
+from sqlalchemy.dialects.postgresql import UUID, ARRAY, JSONB, TSVECTOR
 from sqlalchemy.orm import relationship
 
 from app.database import Base
@@ -169,4 +169,26 @@ class AuditLog(Base):
     version = Column(Integer, nullable=True)
     correlation_id = Column(UUID(as_uuid=True), nullable=False, index=True)
     details = Column(JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+
+
+class KnowledgeDocument(Base):
+    """Lab 4 knowledge base: role guides, job descriptions and learning resources (full-text indexed)."""
+    __tablename__ = "knowledge_documents"
+    __table_args__ = (
+        Index("ix_knowledge_documents_search", "search_vector", postgresql_using="gin"),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    doc_type = Column(String(30), nullable=False, index=True)  # role_guide | job_description | learning_resource
+    title = Column(String(255), nullable=False)
+    content = Column(Text, nullable=False)
+    source = Column(String(255), nullable=False)
+    url = Column(String(500), nullable=True)
+    role_family = Column(String(50), nullable=True, index=True)
+    tags = Column(ARRAY(Text), nullable=True)
+    search_vector = Column(
+        TSVECTOR,
+        Computed("to_tsvector('english', coalesce(title, '') || ' ' || coalesce(content, ''))", persisted=True),
+    )
     created_at = Column(DateTime(timezone=True), default=utcnow)

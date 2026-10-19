@@ -12,7 +12,9 @@ class UserRegister(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=8, max_length=128)
     full_name: str = Field(..., min_length=1, max_length=255)
-    role: str = Field(..., pattern="^(student|placement_officer|faculty|admin)$")
+    # Self-registration creates student accounts only; Placement Cell accounts are
+    # created by an administrator (scripts/create_user.py). Any other value is rejected.
+    role: str = Field("student", pattern="^student$")
 
     @field_validator("password")
     @classmethod

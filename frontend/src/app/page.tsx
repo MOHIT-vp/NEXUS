@@ -66,11 +66,6 @@ export default function Home() {
                     <ArrowRight className="w-4 h-4" />
                   </PBButton>
                 </Link>
-                <Link href="/officer">
-                  <PBButton size="lg" variant="outline">
-                    Placement Cell
-                  </PBButton>
-                </Link>
               </div>
             </div>
 
@@ -103,7 +98,7 @@ export default function Home() {
       {/* ────────────────────────────────────────────
           TRUST STRIP
       ──────────────────────────────────────────── */}
-      <section className="py-16 border-y border-border-subtle">
+      <section id="about" className="py-16 border-y border-border-subtle scroll-mt-24">
         <div className="max-w-7xl mx-auto px-6 lg:px-8">
           <p className="type-h2 text-center mb-12">
             One profile. Four intelligence layers.
@@ -130,7 +125,7 @@ export default function Home() {
       {/* ────────────────────────────────────────────
           HOW IT WORKS
       ──────────────────────────────────────────── */}
-      <section id="how-it-works" className="py-20 lg:py-28">
+      <section id="how-it-works" className="py-20 lg:py-28 scroll-mt-24">
         <div className="max-w-7xl mx-auto px-6 lg:px-8">
           <div className="text-center mb-16">
             <p className="type-micro text-bronze mb-3">HOW IT WORKS</p>
@@ -227,15 +222,17 @@ export default function Home() {
       {/* ────────────────────────────────────────────
           FOOTER
       ──────────────────────────────────────────── */}
-      <footer className="border-t border-border-subtle py-8">
+      <footer id="contact" className="border-t border-border-subtle py-8 scroll-mt-24">
         <div className="max-w-7xl mx-auto px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-4">
           <div className="flex items-center gap-2">
             <span className="text-2xl font-medium text-bronze-dark/60 font-stardom">
               NEXUS
             </span>
           </div>
-          <p className="text-xs text-bronze-dark/40">
-            Career intelligence for placement readiness. No data stored.
+          <p className="text-xs text-bronze-dark/40 text-center sm:text-right">
+            Questions about your plan or account? Contact your college Placement Cell.
+            <br />
+            Career intelligence for placement readiness.
           </p>
         </div>
       </footer>

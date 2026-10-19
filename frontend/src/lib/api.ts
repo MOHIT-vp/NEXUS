@@ -5,13 +5,105 @@
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
 
+// ------------------------------------------------------------------
+// Session — kept per browser TAB (sessionStorage), so each tab can be signed in
+// as a different account (e.g. Student, Placement Cell and Admin side by side).
+// A new tab starts signed out; closing the tab ends that tab's session.
+// ------------------------------------------------------------------
+
+export type UserRole = "student" | "placement_officer" | "admin";
+export interface SessionUser { id: string; email: string; full_name: string; role: UserRole }
+
+const SESSION_KEYS = ["auth_token", "auth_refresh", "auth_user", "active_run_id"];
+
+function tabStore(): Storage | null {
+  if (typeof window === "undefined") return null;
+  try {
+    // One-time clean-up of the old shared (whole-browser) sign-in
+    SESSION_KEYS.forEach((k) => localStorage.removeItem(k));
+    return window.sessionStorage;
+  } catch {
+    return null;
+  }
+}
+
+export function getActiveRunId(): string | null {
+  return tabStore()?.getItem("active_run_id") ?? null;
+}
+
+export function setActiveRunId(runId: string) {
+  tabStore()?.setItem("active_run_id", runId);
+}
+
+export function getToken(): string | null {
+  if (typeof window === "undefined") return null;
+  return tabStore()?.getItem("auth_token") ?? null;
+}
+
+export function getSessionUser(): SessionUser | null {
+  if (typeof window === "undefined") return null;
+  try {
+    return JSON.parse(tabStore()?.getItem("auth_user") || "null");
+  } catch {
+    return null;
+  }
+}
+
+/** Sign out: the server revokes the token, then the browser forgets it. */
+export function signOut(notifyServer = true) {
+  const token = getToken();
+  if (notifyServer && token) {
+    const refresh = tabStore()?.getItem("auth_refresh");
+    fetch(`${API_BASE_URL}/api/v1/auth/logout`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(refresh ? { refresh_token: refresh } : {}),
+      keepalive: true,
+    }).catch(() => {});
+  }
+  SESSION_KEYS.forEach((k) => tabStore()?.removeItem(k));
+}
+
 /**
- * Fetch wrapper — no authentication for MVP.
+ * The access token lasts 30 minutes; renew it with the refresh token so a long
+ * session (e.g. a 45-minute mock test) isn't cut off. Concurrent callers share one renewal.
  */
-async function fetchAPI(endpoint: string, options: RequestInit = {}) {
+let renewing: Promise<boolean> | null = null;
+async function renewSession(): Promise<boolean> {
+  const refresh = tabStore()?.getItem("auth_refresh");
+  if (!refresh) return false;
+  renewing ??= (async () => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/v1/auth/refresh`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refresh_token: refresh }),
+      });
+      if (!res.ok) return false;
+      const data = await res.json();
+      tabStore()?.setItem("auth_token", data.access_token);
+      if (data.refresh_token) tabStore()?.setItem("auth_refresh", data.refresh_token);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      setTimeout(() => { renewing = null; }, 0);
+    }
+  })();
+  return renewing;
+}
+
+/**
+ * Fetch wrapper — sends the signed-in user's token. The server decides what
+ * each role may do; on a 401 the session is renewed once, otherwise we go back to sign-in.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function fetchAPI(endpoint: string, options: RequestInit = {}, retried = false): Promise<any> {
   const headers: Record<string, string> = {
     ...((options.headers as Record<string, string>) || {}),
   };
+  const token = getToken();
+  if (token) headers["Authorization"] = `Bearer ${token}`;
 
   // Only set Content-Type for JSON requests (not FormData)
   if (!(options.body instanceof FormData)) {
@@ -22,6 +114,20 @@ async function fetchAPI(endpoint: string, options: RequestInit = {}) {
     ...options,
     headers,
   });
+
+  // Not signed in (or the session ended, e.g. signed out in another tab): go to sign-in
+  // instead of surfacing an error. Public pages (home, login) just get the error.
+  if (response.status === 401 && typeof window !== "undefined" && !endpoint.startsWith("/api/v1/auth/")) {
+    if (!retried && token && await renewSession()) {
+      return fetchAPI(endpoint, options, true);
+    }
+    const path = window.location.pathname;
+    if (path !== "/" && !path.startsWith("/login")) {
+      signOut(false);
+      window.location.href = `/login?next=${encodeURIComponent(path)}`;
+      return new Promise<never>(() => {});   // page is leaving; don't raise errors on the way out
+    }
+  }
 
   if (!response.ok) {
     let errorDetail: string | undefined;
@@ -95,6 +201,107 @@ async function fetchAPI(endpoint: string, options: RequestInit = {}) {
 }
 
 // ------------------------------------------------------------------
+// Auth API
+// ------------------------------------------------------------------
+
+async function storeSession(tokenResponse: { access_token: string; refresh_token?: string; user: SessionUser }) {
+  // A new sign-in in this tab replaces whoever was signed in here before
+  tabStore()?.removeItem("active_run_id");
+  tabStore()?.setItem("auth_token", tokenResponse.access_token);
+  if (tokenResponse.refresh_token) tabStore()?.setItem("auth_refresh", tokenResponse.refresh_token);
+  tabStore()?.setItem("auth_user", JSON.stringify(tokenResponse.user));
+  return tokenResponse.user;
+}
+
+/** Sign in with email + password (students and Placement Cell). */
+export async function login(email: string, password: string): Promise<SessionUser> {
+  const body = new URLSearchParams({ username: email, password });
+  const res = await fetch(`${API_BASE_URL}/api/v1/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+  if (!res.ok) {
+    const detail = await res.json().then((d) => d?.detail).catch(() => null);
+    if (res.status === 401) throw new Error("Incorrect email or password.");
+    throw new Error(typeof detail === "string" ? detail : "Sign-in failed. Try again.");
+  }
+  return storeSession(await res.json());
+}
+
+/**
+ * The run whose plan a returning student should see: the published plan if there
+ * is one, otherwise their latest run (still in review). Remembered in this browser.
+ */
+export async function findMyRunId(): Promise<string | null> {
+  const me = await fetchAPI("/api/v1/dashboard/me");
+  const runId: string | null = me.published_run_id || me.workflow_status?.run_id || null;
+  if (runId) setActiveRunId(runId);
+  return runId;
+}
+
+/** Request a Placement Cell account. It stays inactive until an administrator approves it. */
+export async function registerPlacementCell(fullName: string, email: string, password: string): Promise<{ message: string }> {
+  return fetchAPI("/api/v1/auth/register-placement-cell", {
+    method: "POST",
+    body: JSON.stringify({ full_name: fullName, email, password }),
+  });
+}
+
+/** Create a student account and sign in. */
+export async function registerStudent(fullName: string, email: string, password: string): Promise<SessionUser> {
+  const data = await fetchAPI("/api/v1/auth/register", {
+    method: "POST",
+    body: JSON.stringify({ full_name: fullName, email, password }),
+  });
+  return storeSession(data);
+}
+
+// ------------------------------------------------------------------
+// Consent (one record per data source)
+// ------------------------------------------------------------------
+
+export type ConsentSource = "resume_processing" | "github" | "leetcode" | "academic_records";
+
+export async function grantConsent(consentType: ConsentSource) {
+  return fetchAPI("/api/v1/consents/me/grant", { method: "POST", body: JSON.stringify({ consent_type: consentType }) });
+}
+
+export async function revokeConsent(consentType: ConsentSource) {
+  return fetchAPI("/api/v1/consents/me/revoke", { method: "POST", body: JSON.stringify({ consent_type: consentType }) });
+}
+
+// ------------------------------------------------------------------
+// Career planner (clarifying questions + plan revision)
+// ------------------------------------------------------------------
+
+export interface PlannerQuestion { id: string; question: string; help: string; type: string; options: string[] }
+export interface PlannerResponse {
+  status: "needs_clarification" | "draft_ready";
+  questions: PlannerQuestion[];
+  slots: Record<string, unknown>;
+  plan?: {
+    target_roles: string[];
+    target_role_details: { title: string }[];
+    skill_level: string;
+    timeline_weeks: number;
+    priorities: string[];
+    steps: { phase: number; title: string; weeks: string; detail: string }[];
+  };
+  changes?: string[];
+  message?: string | null;
+}
+
+export async function clarifyPlan(payload: {
+  request: string;
+  slots?: Record<string, unknown> | null;
+  answers?: Record<string, string | string[]>;
+  feedback?: string;
+}): Promise<PlannerResponse> {
+  return fetchAPI("/api/v1/planner/clarify", { method: "POST", body: JSON.stringify(payload) });
+}
+
+// ------------------------------------------------------------------
 // Process API (Workflow)
 // ------------------------------------------------------------------
 
@@ -116,6 +323,7 @@ export async function getWorkflowStatus(runId: string): Promise<{
   status: string;
   current_step: string | null;
   student_id: string | null;
+  validation_failures?: { code: string; name: string; message: string }[];
 }> {
   return fetchAPI(`/api/v1/process/status/${runId}`);
 }
@@ -158,6 +366,24 @@ export async function submitDecision(
     method: "POST",
     body: JSON.stringify({ decision, comments }),
   });
+}
+
+/** Officer edit: reviewer note and/or rewritten gap recommendations (re-validated on save). */
+export async function editRun(
+  runId: string,
+  edits: { officer_note?: string; gap_recommendations?: Record<string, string> }
+): Promise<{ status: string; validation_passed: boolean; failing_checks: string[] }> {
+  return fetchAPI(`/api/v1/approvals/${runId}/edit`, { method: "POST", body: JSON.stringify(edits) });
+}
+
+/** Officer override: publish despite warning-level findings, with a written reason. */
+export async function overrideRun(runId: string, reason: string): Promise<Record<string, unknown>> {
+  return fetchAPI(`/api/v1/approvals/${runId}/override`, { method: "POST", body: JSON.stringify({ reason }) });
+}
+
+/** Roll a student's published plan back to an earlier version. */
+export async function rollbackVersion(versionId: string): Promise<{ message: string }> {
+  return fetchAPI(`/api/v1/versions/${versionId}/rollback`, { method: "POST" });
 }
 
 /** Get officer queue with auth (original, for future use). */
@@ -591,3 +817,88 @@ export async function regenerateResumePerfection(
   });
 }
 
+
+// ------------------------------------------------------------------
+// Admin (system management — accounts and audit log)
+// ------------------------------------------------------------------
+
+export interface AdminAccount { id: string; email: string; full_name: string; role: UserRole; is_active: boolean; created_at?: string }
+export interface AdminStats {
+  total_workflow_runs: number; pending_review: number; validation_failed: number;
+  approved: number; rejected: number; published_versions: number; users_by_role: Record<string, number>;
+}
+export interface AuditEntry {
+  id: string; timestamp: string | null; actor: string; actor_type: string; agent: string | null;
+  action: string; entity_type: string | null; workflow_run_id: string | null; details: Record<string, unknown>;
+}
+
+export const getAdminStats = (): Promise<AdminStats> => fetchAPI("/api/v1/admin/stats");
+export const listAccounts = (): Promise<AdminAccount[]> => fetchAPI("/api/v1/admin/users");
+export const createStaffAccount = (body: { email: string; full_name: string; password: string; role: "placement_officer" | "admin" }): Promise<AdminAccount> =>
+  fetchAPI("/api/v1/admin/users", { method: "POST", body: JSON.stringify(body) });
+export const setAccountActive = (id: string, is_active: boolean): Promise<AdminAccount> =>
+  fetchAPI(`/api/v1/admin/users/${id}`, { method: "PATCH", body: JSON.stringify({ is_active }) });
+export const getAuditLog = (limit = 100): Promise<AuditEntry[]> => fetchAPI(`/api/v1/admin/audit?limit=${limit}`);
+
+// ------------------------------------------------------------------
+// Mock-interview practice (questions from the published plan)
+// ------------------------------------------------------------------
+
+export interface PracticeQuestion { index: number; text: string; type: string; skill_targeted?: string; difficulty?: string }
+export interface PracticeFeedback {
+  score: number; max_score: number; method: "llm" | "rubric"; strengths: string[]; improvements: string[];
+  note?: string; ai_generated: boolean; disclaimer: string;
+}
+export const getPracticeQuestions = (): Promise<{ questions: PracticeQuestion[] }> => fetchAPI("/api/v1/interviews/practice");
+export const answerPracticeQuestion = (question_index: number, answer: string): Promise<PracticeFeedback> =>
+  fetchAPI("/api/v1/interviews/practice", { method: "POST", body: JSON.stringify({ question_index, answer }) });
+
+// ------------------------------------------------------------------
+// Mock interview (timed practice rounds)
+// ------------------------------------------------------------------
+
+export type MockKind = "mcq" | "coding" | "spoken" | "essay";
+export interface MockSection {
+  id: string; title: string; kind: MockKind; description: string; available: number;
+  default_count: number; default_minutes: number; subjects?: string[] | null;
+  subject_counts?: Record<string, number> | null;
+}
+export interface MockQuestion {
+  id: string; question?: string; options?: string[]; topic?: string; prompt?: string;
+  title?: string; difficulty?: string; description?: string; starter_code?: string; function_name?: string;
+  examples?: { input: string; output: string }[];
+}
+export interface MockSession {
+  session_token: string; section: string; title: string; kind: MockKind; minutes: number;
+  started_at: number; ends_at: number; questions: MockQuestion[];
+}
+/* eslint-disable @typescript-eslint/no-explicit-any */
+export interface MockResult {
+  section: string; title: string; kind: MockKind; questions: number; time_taken_seconds: number;
+  time_limit_minutes: number; submitted_late: boolean; percentage: number; score: number; max_score: number;
+  items: any[]; by_topic?: Record<string, { correct: number; total: number }>;
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
+export interface MockHistoryItem { at: string; section: string; title: string; score: number; max_score: number; percentage: number; questions: number }
+
+export const getMockSections = (): Promise<MockSection[]> => fetchAPI("/api/v1/mock/sections");
+export const startMock = (body: { section: string; count: number; minutes: number; subjects?: string[] }): Promise<MockSession> =>
+  fetchAPI("/api/v1/mock/start", { method: "POST", body: JSON.stringify(body) });
+export const submitMock = (body: { session_token: string; answers: Record<string, unknown>; durations?: Record<string, number> }): Promise<MockResult> =>
+  fetchAPI("/api/v1/mock/submit", { method: "POST", body: JSON.stringify(body) });
+export const getMockHistory = (): Promise<MockHistoryItem[]> => fetchAPI("/api/v1/mock/history");
+
+// ------------------------------------------------------------------
+// Skill benchmark library (Placement Cell)
+// ------------------------------------------------------------------
+
+export type BenchmarkLevel = "beginner" | "intermediate" | "advanced" | "expert";
+export interface BenchmarkItem { id: string; skill: string; expected_level: BenchmarkLevel; importance: "required" | "preferred"; source: string | null; updated_at: string | null }
+export interface BenchmarkRole { role_key: string; title: string; skills: BenchmarkItem[] }
+
+export const listBenchmarks = (): Promise<BenchmarkRole[]> => fetchAPI("/api/v1/benchmarks");
+export const addBenchmark = (roleKey: string, body: { skill: string; expected_level: string; importance: string; source?: string }): Promise<BenchmarkItem> =>
+  fetchAPI(`/api/v1/benchmarks/${roleKey}`, { method: "POST", body: JSON.stringify(body) });
+export const updateBenchmark = (id: string, body: { expected_level?: string; importance?: string; source?: string }): Promise<BenchmarkItem> =>
+  fetchAPI(`/api/v1/benchmarks/item/${id}`, { method: "PATCH", body: JSON.stringify(body) });
+export const removeBenchmark = (id: string): Promise<void> => fetchAPI(`/api/v1/benchmarks/item/${id}`, { method: "DELETE" });

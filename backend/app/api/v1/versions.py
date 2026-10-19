@@ -17,7 +17,44 @@ from app.api.deps import get_current_user, get_db, require_role
 from app.models.user import User
 from app.models.workflow import Version, WorkflowRun, AuditLog
 
+async def _assert_own_or_staff(db: AsyncSession, user: User, student_id: uuid.UUID) -> None:
+    if user.role != "student":
+        return
+    from app.models.user import Student
+    own = (await db.execute(select(Student.id).where(Student.user_id == user.id))).scalar_one_or_none()
+    if own != student_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Version not found")
+
+
 router = APIRouter(prefix="/versions", tags=["Versions"])
+
+
+async def _rollback_problems(db: AsyncSession, target: Version) -> List[str]:
+    """Why a stored version may not be re-published now (empty list = OK)."""
+    from app.agents.validation_agent import validation_agent_node
+    from app.models.user import Consent
+    from app.services.consent import consent_status, is_granted, missing_required
+
+    snap = target.snapshot or {}
+    problems: List[str] = []
+    consents = consent_status((await db.execute(select(Consent).where(Consent.student_id == target.student_id))).scalars().all())
+    if missing_required(consents):
+        problems.append("the student has withdrawn consent to process their resume")
+    used = {s.get("source") for s in (snap.get("coding_analytics") or {}).get("sources", []) if s.get("status") == "ok"}
+    for source in sorted(used & {"github", "leetcode"}):
+        if not is_granted(consents, source):
+            problems.append(f"it uses {source} data the student no longer shares")
+    academic = (snap.get("student_context") or {}).get("academic") or {}
+    if academic.get("cgpa") is not None and not is_granted(consents, "academic_records"):
+        problems.append("it uses academic records the student no longer shares")
+    try:
+        report = validation_agent_node({**snap, "consent_validated": not missing_required(consents)})["validation_report"]
+        failed = [c["name"] for c in report.get("checks", []) if not c["passed"] and c["severity"] == "error"]
+    except Exception as exc:  # a snapshot that cannot be validated is not restored
+        failed = [f"validation could not run ({exc.__class__.__name__})"]
+    if failed:
+        problems.append("required checks now fail: " + ", ".join(failed))
+    return problems
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +91,7 @@ class RollbackResponse(BaseModel):
 @router.post("/", response_model=VersionResponse, status_code=status.HTTP_201_CREATED)
 async def create_version(
     request: VersionCreateRequest,
-    current_user: User = Depends(require_role("placement_officer", "admin")),
+    current_user: User = Depends(require_role("placement_officer")),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -89,7 +126,7 @@ async def create_version(
         entity_type=request.entity_type,
         version_number=next_version_number,
         status="published",
-        snapshot=request.snapshot,
+        snapshot=run.result_snapshot,   # always the reviewed draft, never client-supplied content
         workflow_run_id=request.workflow_run_id,
         approved_by=current_user.id,
         published_at=datetime.now(timezone.utc),
@@ -130,7 +167,8 @@ async def list_student_versions(
     current_user: User = Depends(require_role("placement_officer", "admin", "student")),
     db: AsyncSession = Depends(get_db),
 ):
-    """List all versions for a student, optionally filtered by entity_type."""
+    """List all versions for a student, optionally filtered by entity_type (students: own only)."""
+    await _assert_own_or_staff(db, current_user, student_id)
     query = select(Version).where(Version.student_id == student_id)
     if entity_type:
         query = query.where(Version.entity_type == entity_type)
@@ -168,6 +206,7 @@ async def get_version_snapshot(
     version = result.scalar_one_or_none()
     if not version:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Version not found")
+    await _assert_own_or_staff(db, current_user, version.student_id)
 
     return {
         "version_id": str(version.id),
@@ -183,7 +222,7 @@ async def get_version_snapshot(
 @router.post("/{version_id}/rollback", response_model=RollbackResponse)
 async def rollback_to_version(
     version_id: uuid.UUID,
-    current_user: User = Depends(require_role("placement_officer", "admin")),
+    current_user: User = Depends(require_role("placement_officer")),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -200,6 +239,17 @@ async def rollback_to_version(
             status_code=status.HTTP_409_CONFLICT,
             detail="Cannot roll back to a version that was itself rolled back.",
         )
+
+    # Re-check before restoring: the old plan must still pass the required checks,
+    # and must not rely on data the student has since stopped sharing.
+    problems = await _rollback_problems(db, target)
+    if problems:
+        db.add(AuditLog(actor_id=current_user.id, actor_type="placement_officer", action="version_rollback_refused",
+                        entity_type="version", entity_id=version_id, version=target.version_number,
+                        correlation_id=uuid.uuid4(), details={"problems": problems, "student_id": str(target.student_id)}))
+        await db.commit()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail={"message": "This version can't be restored: " + "; ".join(problems), "problems": problems})
 
     # Archive all other published versions for this student + entity_type
     all_versions_result = await db.execute(
@@ -227,6 +277,7 @@ async def rollback_to_version(
         correlation_id=uuid.uuid4(),
         details={
             "rolled_back_to_version": target.version_number,
+            "revalidated": True,
             "entity_type": target.entity_type,
             "student_id": str(target.student_id),
         },

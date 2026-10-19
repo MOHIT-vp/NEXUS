@@ -59,6 +59,34 @@ class Settings(BaseSettings):
     TOKEN_BUDGET: int = 100000
     RUN_TIMEOUT_SECONDS: int = 300
 
+    # Coding-platform connectors (public APIs; GITHUB_TOKEN only raises the rate limit)
+    GITHUB_API_URL: str = "https://api.github.com"
+    GITHUB_TOKEN: str = ""
+    LEETCODE_GRAPHQL_URL: str = "https://leetcode.com/graphql"
+    CONNECTOR_TIMEOUT_SECONDS: float = 10.0
+    CODING_DATA_STALE_HOURS: int = 24
+
+    # Knowledge base backend: "postgres_fts" (default, no extensions) or "pgvector"
+    KB_BACKEND: str = "postgres_fts"
+
+    # Run checkpoints (Lab 6): "sqlite" keeps each run's progress on disk so an
+    # interrupted run resumes from its last completed step; "memory" does not survive a restart.
+    CHECKPOINT_BACKEND: str = "sqlite"
+    CHECKPOINT_DB_PATH: str = "./data/checkpoints.sqlite"
+    RESUME_INTERRUPTED_RUNS_ON_STARTUP: bool = True
+
+    # Similarity search: "model" = local sentence-embedding model (fastembed, downloaded once),
+    # "hashed" = lexical hashed vectors (no download). Falls back to "hashed" if the model can't load.
+    EMBEDDING_BACKEND: str = "model"
+    EMBEDDING_MODEL: str = "BAAI/bge-small-en-v1.5"
+    EMBEDDING_CACHE_DIR: str = "./data/models"
+
+    @property
+    def llm_enabled(self) -> bool:
+        """LLM narration runs only when a real key is configured; otherwise agents stay deterministic."""
+        key = (self.LLM_API_KEY or "").strip()
+        return bool(key) and key not in ("dummy", "your-api-key-here")
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
 

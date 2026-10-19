@@ -769,89 +769,37 @@ class TestAdvancedResumeRobustness:
         assert "NO_CROSS_STUDENT_LEAK" in result.get("failing_checks", [])
 
     def test_resume_agent_preserves_resume_data_in_state(self):
-        """Resume agent must preserve is_duplicate, similarity_score, and matched_student_id in resume_data."""
+        """Resume agent keeps the verification metadata and parses without any fixture fallback."""
         from app.agents.resume_agent import resume_agent_node
-        from unittest.mock import patch
+        from tests.support import SOFTWARE_RESUME
 
-        initial_state = {
+        state = {
             "consent_validated": True,
-            "resume_data": {
-                "file_path": "/tmp/dummy.pdf",
-                "mime_type": "application/pdf",
-                "raw_text": "Sample text",
-                "is_duplicate": True,
-                "similarity_score": 0.95,
-                "matched_student_id": "other-student-uuid",
-            },
+            "consent_status": {"resume_processing": {"status": "granted"}},
+            "resume_data": {"raw_text": SOFTWARE_RESUME, "file_name": "cv.docx", "is_duplicate": True,
+                            "similarity_score": 0.95, "matched_student_id": "other-student-uuid"},
         }
+        output = resume_agent_node(state)
+        out = output["resume_data"]
+        assert out["is_duplicate"] is True and out["similarity_score"] == 0.95
+        assert out["matched_student_id"] == "other-student-uuid"
+        assert {"Python", "SQL", "Docker"} <= {x["name"] for x in output["student_profile"]["skills"]}
 
-        mock_extraction = MagicMock()
-        mock_extraction.skills = []
-        mock_extraction.projects = []
-        mock_extraction.experiences = []
-        mock_extraction.education = None
-        mock_extraction.summary = "Test summary"
-        mock_extraction.inconsistencies_found = []
-
-        with patch("app.agents.resume_agent.extract_text_from_file", return_value="Sample resume text for testing"):
-            with patch("app.agents.resume_agent.get_resume_llm") as mock_llm_factory:
-                mock_llm = MagicMock()
-                mock_llm.invoke.return_value = mock_extraction
-                mock_llm_factory.return_value.with_structured_output.return_value = mock_llm
-
-                output = resume_agent_node(initial_state)
-                resume_data_out = output.get("resume_data", {})
-                assert resume_data_out.get("is_duplicate") is True, "resume_agent wiped out is_duplicate flag!"
-                assert resume_data_out.get("similarity_score") == 0.95
-                assert resume_data_out.get("matched_student_id") == "other-student-uuid"
-                assert "extracted_text" in resume_data_out
+    def test_resume_agent_refuses_without_consent(self):
+        from app.agents.resume_agent import resume_agent_node
+        out = resume_agent_node({"consent_validated": True, "consent_status": {"resume_processing": {"status": "missing"}},
+                                 "resume_data": {"raw_text": "x"}})
+        assert "student_profile" not in out and "consent" in out["errors"][0]
 
 
-@pytest.mark.asyncio
 class TestProcessEndpointVerification:
-    """Test the /api/v1/process/upload endpoint for duplicate rejection."""
 
-    async def test_process_upload_rejects_duplicate_resume(self):
-        from httpx import AsyncClient, ASGITransport
-        from unittest.mock import patch
-        from app.main import app
-        from app.api.deps import get_db
-
-        mock_db = AsyncMock()
-        mock_db.commit = AsyncMock()
-        mock_db.refresh = AsyncMock()
-        mock_db.add = MagicMock()
-
-        app.dependency_overrides[get_db] = lambda: mock_db
-
-        fake_verification = ResumeVerificationResult(
-            is_duplicate=True,
-            confidence="high",
-            similarity_score=0.94,
-            matched_resume_id=uuid.uuid4(),
-            matched_student_id=uuid.uuid4(),
-            matched_student_name="Alice Walker",
-            metrics={"bullet_overlap": 0.95},
-            reasons=["High similarity (94.0%) detected."],
-            status="flagged_duplicate",
-        )
-
-        try:
-            with patch("app.api.v1.process.get_or_create_demo_student") as mock_get_student:
-                mock_student = MagicMock()
-                mock_student.id = uuid.uuid4()
-                mock_student.user_id = uuid.uuid4()
-                mock_student.user = None
-                mock_get_student.return_value = mock_student
-
-                with patch("app.api.v1.process.extract_text_from_file", return_value="Some text"):
-                    with patch("app.api.v1.process.verify_resume_uniqueness", new=AsyncMock(return_value=fake_verification)):
-                        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-                            files = {"file": ("clone_resume.pdf", b"%PDF-1.4 test", "application/pdf")}
-                            resp = await client.post("/api/v1/process/upload", files=files)
-                            assert resp.status_code == 409
-                            assert "Resume validation failed" in resp.json()["detail"]
-        finally:
-            app.dependency_overrides.clear()
-
-
+    async def test_process_upload_rejects_duplicate_resume(self, client):
+        from tests.support import SOFTWARE_RESUME, grant, register_student, upload
+        a = await register_student(client, name="Asha Rao")
+        await grant(client, a["headers"], "resume_processing")
+        assert (await upload(client, a["headers"])).status_code == 200
+        b = await register_student(client, name="Vikram Shah")
+        await grant(client, b["headers"], "resume_processing")
+        r = await upload(client, b["headers"], SOFTWARE_RESUME.replace("Asha Rao", "Vikram Shah"))
+        assert r.status_code == 409

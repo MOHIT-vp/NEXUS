@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import (
-    Boolean, Column, DateTime, ForeignKey, Integer, Numeric,
+    Boolean, Column, Date, DateTime, ForeignKey, Integer, Numeric,
     String, Text, UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
@@ -50,6 +50,12 @@ class Job(Base):
     location = Column(String(255), nullable=True)
     is_active = Column(Boolean, default=True)
     embedding = Column(JSONB, nullable=True) # Replaced Vector with JSONB for MVP without pgvector
+    # Drive details shown on the drives page (previously only kept in memory)
+    max_backlogs = Column(Integer, default=0)
+    drive_date = Column(Date, nullable=True)
+    deadline = Column(Date, nullable=True)
+    status = Column(String(20), default="upcoming")  # upcoming | active | closed | completed
+    selection_rounds = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow)
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 

@@ -5,6 +5,9 @@ from app.api.v1 import auth, workflows, resumes, evidence, approvals, versions, 
 from app.api.v1 import profiles, analysis, matching, interviews
 from app.api.v1 import dashboard, admin, chat, companies
 from app.api.v1 import coding
+from app.api.v1 import planner
+from app.api.v1 import mock
+from app.api.v1 import benchmarks
 
 # Initialize the v1 router
 api_router = APIRouter()
@@ -37,3 +40,8 @@ api_router.include_router(companies.router)
 
 # Coding Practice
 api_router.include_router(coding.router)
+
+# Career planner — clarifying questions and plan revision (Lab 1)
+api_router.include_router(planner.router)
+api_router.include_router(mock.router)
+api_router.include_router(benchmarks.router)

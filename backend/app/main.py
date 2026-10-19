@@ -125,6 +125,34 @@ if settings.cors_origins_list:
 app.include_router(api_router, prefix="/api/v1")
 
 
+@app.on_event("startup")
+async def _resume_interrupted_runs() -> None:
+    """Lab 6: continue runs that a crash or restart cut off, from their last saved step."""
+    if not settings.RESUME_INTERRUPTED_RUNS_ON_STARTUP:
+        return
+    import asyncio
+    import logging
+    from app.services.pipeline import resume_interrupted_runs
+
+    async def _go():
+        try:
+            outcomes = await resume_interrupted_runs()
+            if outcomes:
+                logging.getLogger(__name__).info("Resumed interrupted runs: %s", outcomes)
+        except Exception as exc:  # never block the server from starting
+            logging.getLogger(__name__).warning("Could not resume interrupted runs: %s", exc)
+
+    asyncio.get_running_loop().create_task(_go())
+
+
+@app.on_event("startup")
+async def _warm_embedding_model() -> None:
+    """Load the similarity model in the background so the first analysis isn't slowed by it."""
+    import asyncio
+    from app.services.similarity import backend_name
+    asyncio.get_running_loop().run_in_executor(None, backend_name)
+
+
 @app.get("/api/v1/admin/system/health", tags=["System"])
 async def health_check():
     """System health check endpoint."""

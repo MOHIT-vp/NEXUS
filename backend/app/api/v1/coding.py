@@ -6,6 +6,7 @@ environment with strict timeouts and resource bounds. Predefined test cases
 are verified and results returned — nothing is persisted on the backend.
 """
 
+from __future__ import annotations
 import ast
 import json
 import subprocess
@@ -14,8 +15,10 @@ import time
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+
+from app.api.deps import get_current_user
 
 router = APIRouter(prefix="/coding", tags=["Coding Practice"])
 
@@ -659,7 +662,7 @@ def run_code_execution(problem: dict[str, Any], code: str, mode: str = "submit")
 
 
 @router.post("/problems/{problem_id}/submit")
-async def submit_solution(problem_id: str, body: SubmitRequest):
+async def submit_solution(problem_id: str, body: SubmitRequest, _user=Depends(get_current_user)):
     """
     Run student's code against all test cases and return results.
     Nothing is persisted on the backend.
@@ -672,7 +675,7 @@ async def submit_solution(problem_id: str, body: SubmitRequest):
 
 
 @router.post("/problems/{problem_id}/run")
-async def run_solution(problem_id: str, body: SubmitRequest):
+async def run_solution(problem_id: str, body: SubmitRequest, _user=Depends(get_current_user)):
     """Run student's code against sample test cases only."""
     problem = next((p for p in PROBLEMS if p["id"] == problem_id), None)
     if problem is None:
@@ -682,7 +685,7 @@ async def run_solution(problem_id: str, body: SubmitRequest):
 
 
 @router.post("/execute")
-async def execute_code(body: ExecuteRequest):
+async def execute_code(body: ExecuteRequest, _user=Depends(get_current_user)):
     """Unified endpoint to execute code against a problem."""
     problem = next((p for p in PROBLEMS if p["id"] == body.problem_id), None)
     if problem is None:
@@ -692,6 +695,6 @@ async def execute_code(body: ExecuteRequest):
 
 
 @router.post("/tests")
-async def tests_endpoint(body: ExecuteRequest):
+async def tests_endpoint(body: ExecuteRequest, _user=Depends(get_current_user)):
     """Alias for POST /execute as specified in requirement."""
-    return await execute_code(body)
+    return await execute_code(body, _user)

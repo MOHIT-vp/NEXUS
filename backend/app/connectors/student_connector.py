@@ -1,48 +1,40 @@
-"""Govened connector for Student and Profile data."""
+"""Governed connector for student profile and consent data."""
 import uuid
-from typing import Optional, List
+from typing import Any, Dict, Optional
+
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from app.connectors.base import BaseConnector, DataAccessDeniedError
-from app.models.user import Student, Consent
 from app.models.profile import StudentProfile
+from app.models.user import Consent
+from app.services.consent import consent_status
+
 
 class StudentConnector(BaseConnector):
-    """Governs read/write access to student profiles and ensures consent boundaries."""
+    """Governs read access to a student's records and enforces consent boundaries."""
+
+    async def get_consent_status(self, student_id: uuid.UUID) -> Dict[str, Dict[str, Any]]:
+        """Per-source consent read from the Consent table."""
+        result = await self.safe_execute(select(Consent).where(Consent.student_id == student_id))
+        return consent_status(result.scalars().all())
 
     async def verify_consent(self, student_id: uuid.UUID, consent_type: str) -> bool:
-        """Strict governance check: Does this student consent to this operation?"""
-        result = await self.safe_execute(
-            select(Consent).where(
-                Consent.student_id == student_id,
-                Consent.consent_type == consent_type,
-                Consent.granted == True
-            )
-        )
-        return result.scalar_one_or_none() is not None
+        return (await self.get_consent_status(student_id)).get(consent_type, {}).get("status") == "granted"
 
     async def get_student_profile(self, student_id: uuid.UUID) -> Optional[dict]:
-        """Fetch a student's parsed profile securely."""
-        # Governance Gate: Profile processing requires data_sharing consent
-        if not await self.verify_consent(student_id, "data_sharing"):
-             raise DataAccessDeniedError("Student has not consented to data sharing.")
-             
+        """Fetch a student's parsed profile (requires resume_processing consent)."""
+        if not await self.verify_consent(student_id, "resume_processing"):
+            raise DataAccessDeniedError("Student has not consented to resume processing.")
         result = await self.safe_execute(
             select(StudentProfile)
             .where(StudentProfile.student_id == student_id)
             .order_by(StudentProfile.created_at.desc())
-            .options(
-                selectinload(StudentProfile.skills),
-                selectinload(StudentProfile.projects),
-                selectinload(StudentProfile.experiences)
-            )
+            .options(selectinload(StudentProfile.skills), selectinload(StudentProfile.projects))
         )
         profile = result.scalars().first()
         if not profile:
             return None
-            
-        # Serialize to untrusted agent format
         return {
             "id": str(profile.id),
             "summary": profile.summary,

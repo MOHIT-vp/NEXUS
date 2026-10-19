@@ -118,6 +118,12 @@ def validation_route(state: PlacementState) -> str:
     if budget <= 0:
         return "fail_escalate"
 
+    # Failures no agent can fix (missing consent, unverifiable requirements, data
+    # isolation) escalate immediately instead of burning the retry budget.
+    diagnosis = (state.get("validation_report") or {}).get("diagnosis")
+    if diagnosis is not None and not diagnosis.get("can_self_heal", True):
+        return "fail_escalate"
+
     if retry_count < max_retries:
         return "fail_retry"
 

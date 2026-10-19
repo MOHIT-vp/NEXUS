@@ -11,13 +11,13 @@ class TestValidationGate:
     """The ValidationAgent is the final gate before assembly."""
 
     def test_full_valid_state_passes_validation(self, complete_valid_state):
-        """A correctly assembled state must pass all 12 validation checks."""
+        """A correctly assembled state must pass every error-severity validation check."""
         from app.agents.validation_agent import validation_agent_node
         result = validation_agent_node(complete_valid_state)
 
         report = result.get("validation_report", {})
-        assert report.get("total_checks") == 12, \
-            f"Expected 12 checks, got {report.get('total_checks')}"
+        assert report.get("total_checks") == 18, \
+            f"Expected 18 checks, got {report.get('total_checks')}"
         assert result.get("validation_passed") or report.get("error_failures", 0) == 0, \
             f"Unexpected error failures: {report.get('checks', [])}"
 

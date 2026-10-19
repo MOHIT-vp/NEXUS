@@ -1,9 +1,11 @@
 """
 Placement Cell Company Management & Student Preparedness API.
 
-Enables:
-1. Placement Cell to list new recruitment drives coming to campus, update criteria, and view cohort analytics.
-2. Students to inspect upcoming recruitment drives and evaluate their skill match and preparedness.
+Drives are stored in the database (companies, jobs, role_skills), so the drives
+page and the Job Matching Agent always use the same listings.
+
+1. Placement Cell: list, update and close drives; cohort analytics over students' published plans.
+2. Students: browse drives and self-check preparedness from their own data — never from a sample profile.
 """
 from typing import Any, Dict, List, Optional
 import uuid
@@ -12,291 +14,163 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deps import get_current_student, get_current_user, require_role
 from app.database import get_db
+from app.models.user import Student, User
+from app.models.workflow import Version, WorkflowRun
 from app.schemas.company import (
-    CompanyCreate,
-    CompanyUpdate,
-    JobDriveResponse,
-    PreparednessCheckRequest,
-    PreparednessCheckResponse,
-    CohortReadinessResponse,
+    CohortReadinessResponse, CompanyCreate, CompanyUpdate, JobDriveResponse,
+    PreparednessCheckRequest, PreparednessCheckResponse,
 )
+from app.services import drive_repository as repo
 from app.services.company_service import company_service
-from app.models.workflow import WorkflowRun, Version
 
 router = APIRouter(prefix="/companies", tags=["Companies & Recruitment"])
 
 
-# ---------------------------------------------------------------------------
-# Listing & Inspection
-# ---------------------------------------------------------------------------
-
 @router.get("", response_model=List[JobDriveResponse], summary="List all campus recruitment drives")
 async def list_recruitment_drives(
     search: Optional[str] = Query(None, description="Search by company name, role, or skill"),
-    role_family: Optional[str] = Query(None, description="Filter by role domain (software_engineering, data_engineering, devops, etc.)"),
-    status: Optional[str] = Query(None, description="Filter by status (upcoming, active, closed)"),
+    role_family: Optional[str] = Query(None, description="Filter by role domain"),
+    status_filter: Optional[str] = Query(None, alias="status", description="Filter by status (upcoming, active, closed)"),
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
-    """
-    Returns all listed companies and job openings coming for recruitment.
-    Accessible to students and placement officers.
-    """
-    return company_service.list_drives(
-        search=search,
-        role_family=role_family,
-        status=status,
-    )
+    """Listed drives, for any signed-in user."""
+    return [repo.to_response(d) for d in await repo.list_drives(db, search, role_family, status_filter)]
 
 
 @router.get("/jobs/{job_id}", response_model=JobDriveResponse, summary="Get details of a specific recruitment drive")
-async def get_recruitment_drive(job_id: str):
-    """
-    Fetch complete job role criteria, required & preferred skills, and selection rounds.
-    """
-    drive = company_service.get_drive(job_id)
-    if not drive:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Recruitment drive with id '{job_id}' not found."
-        )
-    return drive
+async def get_recruitment_drive(job_id: str, _user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    job = await repo.get_job(db, job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Recruitment drive with id '{job_id}' not found.")
+    return repo.to_response(repo.drive_dict(job))
 
 
-# ---------------------------------------------------------------------------
-# Placement Cell Management
-# ---------------------------------------------------------------------------
-
-@router.post("", response_model=JobDriveResponse, status_code=status.HTTP_201_CREATED, summary="Placement cell lists a new recruitment company")
+@router.post("", response_model=JobDriveResponse, status_code=status.HTTP_201_CREATED,
+             summary="Placement cell lists a new recruitment company")
 async def create_recruitment_drive(
     payload: CompanyCreate,
+    officer: User = Depends(require_role("placement_officer")),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Placement Officer lists a new company coming for campus recruitment.
-    Includes role specifications, package, cutoffs, required skills, and interview rounds.
-    """
-    created = company_service.create_drive(payload)
-
-    # If DB is available, we can also record in database
+    """Saved with its skills, so students are matched against it immediately."""
     try:
-        from app.models.company import Company as DBCompany, Job as DBJob
-        new_comp = DBCompany(
-            name=payload.name.strip(),
-            industry=payload.industry,
-            website=payload.website,
-            location=payload.location,
-            description=payload.description,
-        )
-        db.add(new_comp)
-        await db.flush()
-
-        new_job = DBJob(
-            company_id=new_comp.id,
-            title=payload.role_title.strip(),
-            role_family=payload.role_family,
-            description=payload.description,
-            min_cgpa=payload.min_cgpa,
-            min_experience=payload.min_experience,
-            package_lpa=payload.package_lpa,
-            location=payload.location,
-        )
-        db.add(new_job)
-        await db.commit()
-    except Exception:
-        # Gracefully rollback if DB is in mock/offline mode
-        try:
-            await db.rollback()
-        except Exception:
-            pass
-
-    return created
+        return repo.to_response(await repo.create_drive(db, payload))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
 
 @router.put("/jobs/{job_id}", response_model=JobDriveResponse, summary="Update an existing recruitment drive")
-async def update_recruitment_drive(job_id: str, payload: CompanyUpdate):
-    """
-    Update details, criteria, or schedule of a listed recruitment drive.
-    """
-    updated = company_service.update_drive(job_id, payload)
-    if not updated:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Recruitment drive '{job_id}' not found."
-        )
-    return updated
+async def update_recruitment_drive(
+    job_id: str,
+    payload: CompanyUpdate,
+    officer: User = Depends(require_role("placement_officer")),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        updated = await repo.update_drive(db, job_id, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    if updated is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Recruitment drive '{job_id}' not found.")
+    return repo.to_response(updated)
 
 
 @router.delete("/jobs/{job_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Remove a recruitment drive")
-async def delete_recruitment_drive(job_id: str):
-    """
-    Delete or delist a recruitment drive.
-    """
-    deleted = company_service.delete_drive(job_id)
-    if not deleted:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Recruitment drive '{job_id}' not found."
-        )
+async def delete_recruitment_drive(
+    job_id: str,
+    officer: User = Depends(require_role("placement_officer")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delist a drive (kept in the database for history; no longer listed or matched)."""
+    if not await repo.deactivate_drive(db, job_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Recruitment drive '{job_id}' not found.")
     return None
 
 
-# ---------------------------------------------------------------------------
-# Student Preparedness & Skill Match Check
-# ---------------------------------------------------------------------------
+def _from_snapshot(snap: Dict[str, Any]):
+    """Profile, coding data and consented academic data from a stored plan."""
+    profile = dict(snap.get("student_profile") or {})
+    academic = ((snap.get("student_context") or {}).get("academic") or {})
+    metadata = {"cgpa": academic.get("cgpa"),
+                "coding_solved": ((snap.get("coding_analytics") or {}).get("summary") or {}).get("total_solved")}
+    return profile, snap.get("coding_analytics") or {}, {k: v for k, v in metadata.items() if v is not None}
 
-@router.post("/jobs/{job_id}/check-preparedness", response_model=PreparednessCheckResponse, summary="Student checks preparedness and skill match")
+
+@router.post("/jobs/{job_id}/check-preparedness", response_model=PreparednessCheckResponse,
+             summary="Student checks preparedness and skill match")
 async def check_student_preparedness(
     job_id: str,
     payload: Optional[PreparednessCheckRequest] = None,
+    student: Student = Depends(get_current_student),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Evaluates how well the student's profile matches the requirements of a specific recruitment drive.
-
-    Evaluation includes:
-    1. Overall Readiness Score (0 - 100) & Fit Tier (Highly Prepared, Competitive, Preparation Needed)
-    2. Academic Eligibility & Cutoff verification (Pass/Fail CGPA margin)
-    3. Deterministic component breakdown (Skills, Coding, Projects, Technical depth)
-    4. Matched Skills vs Missing Skills with learning recommendations and estimated hours
-    5. Actionable 2-Week Pre-Drive Roadmap tailored specifically for this company's interview rounds!
+    Self-check against one drive using the student's OWN data: the given run (if it
+    is theirs) or their latest published plan. What-if fields (skills, cgpa,
+    backlogs, coding_solved, projects) can override for simulation. With no data
+    and no what-if input the request is refused — no sample profile is used.
     """
-    drive = company_service.get_drive(job_id)
-    if not drive:
-        # Fallback to ad-hoc drive creation if job_id is a campus drive/slug
-        drive = company_service.get_or_create_adhoc_drive(job_id)
-    if not drive:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Recruitment drive '{job_id}' not found."
-        )
-
-    job_dict = drive.model_dump()
-
-    # Determine student profile:
-    student_profile = {
-        "skills": [],
-        "projects": [],
-        "education": {"gpa": None},
-    }
-    coding_analytics = {}
-    metadata = {}
-
+    job = await repo.get_job(db, job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Recruitment drive '{job_id}' not found.")
     payload = payload or PreparednessCheckRequest()
 
-    # 1. If run_id provided, attempt to load published snapshot or workflow run
+    snap: Dict[str, Any] = {}
     if payload.run_id:
         try:
-            run_uuid = uuid.UUID(payload.run_id)
-            # Try finding published Version first
-            v_res = await db.execute(
-                select(Version)
-                .where(Version.workflow_run_id == run_uuid, Version.status == "published")
-                .order_by(Version.version_number.desc())
-                .limit(1)
-            )
-            v = v_res.scalar_one_or_none()
-            if v and v.snapshot:
-                snap = v.snapshot
-                student_profile = snap.get("student_profile", student_profile)
-                coding_analytics = snap.get("coding_analytics", {})
-                metadata = snap.get("metadata", {})
-            else:
-                # Fallback to WorkflowRun result_snapshot
-                r_res = await db.execute(select(WorkflowRun).where(WorkflowRun.id == run_uuid))
-                run = r_res.scalar_one_or_none()
-                if run and run.result_snapshot:
-                    snap = run.result_snapshot
-                    student_profile = snap.get("student_profile", student_profile)
-                    coding_analytics = snap.get("coding_analytics", {})
-                    metadata = snap.get("metadata", {})
-        except Exception:
-            # Fallback to mock profile if DB query fails
-            pass
+            run = (await db.execute(select(WorkflowRun).where(WorkflowRun.id == uuid.UUID(payload.run_id)))).scalar_one_or_none()
+        except ValueError:
+            run = None
+        if run is None or run.student_id != student.id:
+            raise HTTPException(status_code=404, detail="Workflow run not found.")
+        snap = run.result_snapshot or {}
+    else:
+        v = (await db.execute(select(Version).where(Version.student_id == student.id, Version.status == "published")
+                              .order_by(Version.version_number.desc()).limit(1))).scalar_one_or_none()
+        snap = (v.snapshot or {}) if v else {}
 
-    # 2. If student provided manual / simulated override (e.g. what-if analysis)
-    explicit_skills_provided = payload.skills is not None
-
-    if explicit_skills_provided:
-        student_profile["skills"] = [
-            {"name": s, "proficiency": "intermediate"} for s in (payload.skills or [])
-        ]
-
+    profile, coding, metadata = _from_snapshot(snap)
+    profile.setdefault("skills", [])
+    profile.setdefault("projects", [])
+    if payload.skills is not None:
+        profile["skills"] = [{"name": s, "proficiency": "intermediate"} for s in payload.skills]
     if payload.cgpa is not None:
-        student_profile["education"] = {"gpa": payload.cgpa}
+        profile["education"] = {"gpa": payload.cgpa}
         metadata["cgpa"] = payload.cgpa
-
     if payload.backlogs is not None:
         metadata["backlogs"] = payload.backlogs
-
     if payload.coding_solved is not None:
         metadata["coding_solved"] = payload.coding_solved
-
     if payload.projects is not None:
-        student_profile["projects"] = payload.projects
+        profile["projects"] = payload.projects
 
-    # 3. Only populate baseline if no explicit skills provided and profile has no skills
-    if not explicit_skills_provided and not student_profile.get("skills"):
-        student_profile = {
-            "skills": [
-                {"name": "Python", "proficiency": "advanced"},
-                {"name": "JavaScript", "proficiency": "intermediate"},
-                {"name": "React.js", "proficiency": "intermediate"},
-                {"name": "SQL", "proficiency": "intermediate"},
-                {"name": "Git", "proficiency": "intermediate"},
-                {"name": "Data Structures", "proficiency": "intermediate"},
-            ],
-            "projects": [
-                {"title": "Full-Stack Web App", "technologies": ["React.js", "Python", "SQL"]},
-                {"title": "Algorithmic Trading Bot", "technologies": ["Python", "Git"]},
-            ],
-            "education": {"gpa": payload.cgpa or 8.2},
-        }
-        metadata["coding_solved"] = payload.coding_solved or 120
+    if not profile["skills"] and payload.skills is None:
+        raise HTTPException(status_code=409, detail=(
+            "We don't have your profile yet. Analyse your resume first, or enter skills to simulate."))
 
-    # Evaluate preparedness deterministically
     return company_service.evaluate_student_preparedness(
-        job=job_dict,
-        student_profile=student_profile,
-        coding_analytics=coding_analytics,
-        metadata=metadata,
-    )
+        job=repo.drive_dict(job), student_profile=profile, coding_analytics=coding, metadata=metadata)
 
 
-# ---------------------------------------------------------------------------
-# Placement Cell Cohort Analytics
-# ---------------------------------------------------------------------------
-
-@router.get("/jobs/{job_id}/cohort-readiness", response_model=CohortReadinessResponse, summary="Placement cell cohort readiness analytics")
+@router.get("/jobs/{job_id}/cohort-readiness", response_model=CohortReadinessResponse,
+            summary="Placement cell cohort readiness analytics")
 async def get_cohort_readiness_analytics(
     job_id: str,
+    officer: User = Depends(require_role("placement_officer")),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Returns aggregated placement cell insights for a company's recruitment drive:
-    - Number and percentage of eligible students
-    - Average readiness score across campus
-    - Score distribution (High Fit, Moderate Fit, Needs Prep)
-    - Top common missing skills across students to schedule targeted bootcamps!
-    """
-    # Attempt to gather student profiles from published versions in DB
-    student_profiles = []
-    try:
-        v_res = await db.execute(
-            select(Version)
-            .where(Version.entity_type == "readiness_plan", Version.status == "published")
-            .limit(50)
-        )
-        versions = v_res.scalars().all()
-        for v in versions:
-            if v.snapshot and "student_profile" in v.snapshot:
-                student_profiles.append(v.snapshot["student_profile"])
-    except Exception:
-        pass
-
-    try:
-        return company_service.compute_cohort_readiness(
-            job_id=job_id,
-            student_profiles=student_profiles if student_profiles else None,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    """Eligibility and readiness for this drive across students' published plans (real students only)."""
+    job = await repo.get_job(db, job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Recruitment drive '{job_id}' not found.")
+    versions = (await db.execute(select(Version).where(Version.entity_type == "readiness_plan",
+                                                       Version.status == "published"))).scalars().all()
+    cohort = []
+    for v in versions:
+        profile, coding, metadata = _from_snapshot(v.snapshot or {})
+        if profile.get("skills"):
+            cohort.append({"student_profile": profile, "coding_analytics": coding, "metadata": metadata})
+    return company_service.compute_cohort_readiness(repo.drive_dict(job), cohort)

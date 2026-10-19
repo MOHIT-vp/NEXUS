@@ -33,6 +33,12 @@ class CodingAnalytics(Base):
     streak_days = Column(Integer, default=0)
     active_days = Column(Integer, default=0)
     topic_stats = Column(JSONB, nullable=True)
+    handle = Column(String(100), nullable=True)
+    # ok | not_found | rate_limited | unavailable
+    fetch_status = Column(String(30), nullable=True)
+    source_url = Column(String(500), nullable=True)
+    error_message = Column(Text, nullable=True)
+    profile_data = Column(JSONB, nullable=True)
     last_synced_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow)
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

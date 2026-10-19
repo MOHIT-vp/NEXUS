@@ -22,8 +22,15 @@ from sqlalchemy import select
 from sqlalchemy.orm.attributes import flag_modified
 
 import hashlib
+import asyncio
+import json
+
+
+from app.services.pipeline import run_pipeline
+from app.api.deps import can_view_run, get_current_student, get_current_user
 from app.database import get_db
-from app.models.user import User, Student
+from app.models.user import Consent, User, Student
+from app.services.consent import consent_status, is_granted, missing_required
 from app.models.profile import Resume
 from app.models.workflow import WorkflowRun, AuditLog, Version
 from app.agents.graph import agent_runner
@@ -57,6 +64,7 @@ class StatusResponse(BaseModel):
     status: str
     current_step: Optional[str] = None
     student_id: Optional[str] = None
+    validation_failures: List[Dict[str, Any]] = []
 
 
 class ResumePerfectionSubmitRequest(BaseModel):
@@ -70,59 +78,11 @@ class ResumePerfectionResponse(BaseModel):
     evaluation: Optional[Dict[str, Any]] = None
 
 
-# ---------------------------------------------------------------------------
-# Helpers (MVP Auth Bypass)
-# 
-# SECURITY WARNING: These helpers generate mock users to bypass authentication
-# for the MVP demo. 
-# FUTURE REQUIREMENT: Remove these in Phase 3 and use `get_current_student`
-# and `get_current_user` dependencies from `deps.py`.
-# ---------------------------------------------------------------------------
-
-async def get_or_create_demo_student(db: AsyncSession) -> Student:
-    """Fetch or create a demo student for the MVP upload flow."""
-    demo_email = "student@demo.com"
-    result = await db.execute(select(User).where(User.email == demo_email))
-    user = result.scalar_one_or_none()
-
-    if not user:
-        from app.services.auth import create_user
-        user = await create_user(
-            db=db,
-            email=demo_email,
-            password="password123",
-            full_name="Demo Student",
-            role="student",
-        )
-
-    result = await db.execute(select(Student).where(Student.user_id == user.id))
-    student = result.scalar_one_or_none()
-
-    if not student:
-        student = Student(user_id=user.id)
-        db.add(student)
-        await db.flush()
-
-    return student
-
-
-async def get_or_create_demo_officer(db: AsyncSession) -> User:
-    """Fetch or create a demo placement officer for the MVP flow."""
-    officer_email = "officer@demo.com"
-    result = await db.execute(select(User).where(User.email == officer_email))
-    user = result.scalar_one_or_none()
-
-    if not user:
-        from app.services.auth import create_user
-        user = await create_user(
-            db=db,
-            email=officer_email,
-            password="password123",
-            full_name="Demo Officer",
-            role="placement_officer",
-        )
-
-    return user
+async def _own_run(db: AsyncSession, run_uuid: uuid.UUID, user: User) -> WorkflowRun:
+    run = (await db.execute(select(WorkflowRun).where(WorkflowRun.id == run_uuid))).scalar_one_or_none()
+    if not run or not await can_view_run(db, user, run):
+        raise HTTPException(status_code=404, detail="Workflow run not found.")
+    return run
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +96,10 @@ async def process_resume(
     leetcode_handle: Optional[str] = Form(None),
     coding_solved: int = Form(0),
     cgpa: Optional[float] = Form(None),
+    target_roles: Optional[str] = Form(None),      # JSON list or comma-separated, from the planner
+    career_plan: Optional[str] = Form(None),       # JSON plan returned by /planner/clarify
+    user: User = Depends(get_current_user),
+    student: Student = Depends(get_current_student),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -157,6 +121,36 @@ async def process_resume(
     if len(contents) > 5 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="File exceeds 5 MB limit.")
 
+    # Explicit per-source consent, read from the Consent table (never assumed)
+    consents = consent_status((await db.execute(select(Consent).where(Consent.student_id == student.id))).scalars().all())
+    missing = missing_required(consents)
+    if missing:
+        raise HTTPException(status_code=409, detail="Consent to analyse your resume is required before upload.")
+
+    # Target roles come from the student (career planner); there is no default role
+    roles: List[str] = []
+    if target_roles:
+        try:
+            parsed = json.loads(target_roles)
+            roles = [str(r) for r in parsed] if isinstance(parsed, list) else [str(parsed)]
+        except ValueError:
+            roles = [r.strip() for r in target_roles.split(",")]
+    roles = [r for r in roles if r.strip()]
+    if not roles:
+        raise HTTPException(status_code=409, detail="Tell us your target role first (career goal step).")
+    plan: Dict[str, Any] = {}
+    if career_plan:
+        try:
+            plan = json.loads(career_plan) or {}
+        except ValueError:
+            plan = {}
+
+    # Handles and CGPA are saved on the student's own record
+    if github_username is not None:
+        student.github_url = f"https://github.com/{github_username.strip()}" if github_username.strip() else None
+    if cgpa is not None:
+        student.cgpa = cgpa
+
     # Save to temp file for Resume Agent to read
     suffix = ".pdf" if "pdf" in file.content_type else ".docx"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
@@ -166,10 +160,7 @@ async def process_resume(
         tmp.flush()
         tmp.close()
 
-        # 1. Get or Create Demo Student
-        student = await get_or_create_demo_student(db)
-
-        # 2. Create WorkflowRun in DB
+        # 2. Create WorkflowRun in DB (owned by the authenticated student)
         db_run = WorkflowRun(
             student_id=student.id,
             initiated_by=student.user_id,
@@ -252,7 +243,7 @@ async def process_resume(
                 status_code=409,
                 detail=(
                     f"Resume validation failed: High similarity ({verification.similarity_score * 100:.1f}%) "
-                    f"detected with an existing resume from another student ({verification.matched_student_name or 'registered student'})."
+                    f"detected with an existing resume from another student."
                 ),
             )
 
@@ -271,126 +262,27 @@ async def process_resume(
         db.add(db_resume)
         await db.commit()
 
-        # 4. Build state and invoke the full LangGraph pipeline
-        initial_state: Dict[str, Any] = {
-            "student_id": str(student.id),
-            "run_id": str(db_run.id),
-            "consent_validated": True,
-            "resume_data": {
+        # 4–8. Run the agent pipeline and store the validated draft
+        validation_passed = await run_pipeline(
+            db, db_run=db_run, student=student, actor=user, consents=consents, roles=roles, plan=plan,
+            handles={"github": github_username, "leetcode": leetcode_handle}, cgpa=cgpa, coding_solved=coding_solved,
+            resume_data={
                 "file_path": tmp.name,
+                "file_name": file.filename,
                 "mime_type": file.content_type,
                 "raw_text": raw_text,
                 "is_duplicate": False,
                 "similarity_score": verification.similarity_score,
                 "matched_student_id": str(verification.matched_student_id) if verification.matched_student_id else None,
             },
-            "target_roles": ["software_engineer", "data_engineer"],
-            "current_step": "init",
-            "errors": [],
-            "audit_events": [],
-            "evidence_records": [],
-            "retry_count": 0,
-            "max_retries": 3,
-            "budget_remaining": 100000,
-            "validation_passed": False,
-            "approval_status": "pending",
-        }
-
-        config = {"configurable": {"thread_id": str(db_run.id)}}
-
-        try:
-            final_state = agent_runner.invoke(initial_state, config=config)
-        except Exception as e:
-            db_run.status = "failed"
-            db_run.error_message = str(e)
-            db_run.completed_at = datetime.now(timezone.utc)
-            await db.commit()
-
-            # Audit the failure
-            fail_audit = AuditLog(
-                actor_type="system",
-                workflow_run_id=db_run.id,
-                action="PIPELINE_FAILED",
-                entity_type="workflow_run",
-                entity_id=db_run.id,
-                correlation_id=uuid.uuid4(),
-                details={"error": str(e)},
-            )
-            db.add(fail_audit)
-            await db.commit()
-
-            raise HTTPException(status_code=500, detail=f"Pipeline execution failed: {str(e)}")
-
-        # 5. Build the result snapshot from final state
-        # Generate Resume Perfection verification questions based on extracted profile
-        perfection_questions = generate_resume_perfection_questions(
-            student_profile=final_state.get("student_profile", {}),
-            raw_text=raw_text,
         )
-
-        result_snapshot = {
-            "student_profile": final_state.get("student_profile", {}),
-            "skill_gap_report": final_state.get("skill_gap_report", {}),
-            "coding_analytics": final_state.get("coding_analytics", {}),
-            "matching_result": final_state.get("matching_result", {}),
-            "interview_result": final_state.get("interview_result", {}),
-            "roadmap": final_state.get("roadmap", {}),
-            "validation_report": final_state.get("validation_report", {}),
-            "evidence_count": len(final_state.get("evidence_records", [])),
-            "resume_perfection": {
-                "status": "pending_submission",
-                "questions": [q.model_dump() for q in perfection_questions],
-                "evaluation": None,
-            },
-            "metadata": {
-                "github_username": github_username,
-                "leetcode_handle": leetcode_handle,
-                "coding_solved": coding_solved,
-                "cgpa": cgpa,
-                "validation_passed": final_state.get("validation_passed", False),
-                "generated_at": datetime.now(timezone.utc).isoformat(),
-            },
-        }
-
-        # 6. Persist to DB — status is PENDING_REVIEW (requires officer approval)
-        db_run.status = "pending_review"
-        db_run.current_step = final_state.get("current_step", "completed")
-        db_run.result_snapshot = result_snapshot
-        db_run.completed_at = datetime.now(timezone.utc)
-        await db.commit()
-
-        # 7. Write LangGraph audit events to the audit_logs table
-        audit_events = final_state.get("audit_events", [])
-        if audit_events:
-            await log_workflow_events(
-                db=db,
-                workflow_run_id=str(db_run.id),
-                events=audit_events,
-                actor_id=str(student.user_id),
-                actor_type="agent",
-            )
-
-        # 8. Write completion audit log
-        completion_audit = AuditLog(
-            actor_id=student.user_id,
-            actor_type="system",
-            workflow_run_id=db_run.id,
-            action="SENT_FOR_REVIEW",
-            entity_type="workflow_run",
-            entity_id=db_run.id,
-            correlation_id=uuid.uuid4(),
-            details={
-                "validation_passed": final_state.get("validation_passed", False),
-                "errors_count": len(final_state.get("errors", [])),
-            },
-        )
-        db.add(completion_audit)
-        await db.commit()
 
         return UploadResponse(
             run_id=str(db_run.id),
-            status="pending_review",
-            message="Your profile has been analyzed and is awaiting Placement Officer review.",
+            status=db_run.status,
+            message=("Your profile has been analyzed and is awaiting Placement Officer review."
+                     if validation_passed else
+                     "Your analysis did not pass the required checks, so it was not sent for review."),
         )
 
     finally:
@@ -405,25 +297,26 @@ async def process_resume(
 @router.get("/status/{run_id}", response_model=StatusResponse, summary="Poll workflow status")
 async def get_workflow_status(
     run_id: str,
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Returns the current status of a workflow run for frontend polling."""
+    """Status of the caller's own run (or any run, for the Placement Cell), with validation failures."""
     try:
         run_uuid = uuid.UUID(run_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid run_id format.")
-
-    result = await db.execute(select(WorkflowRun).where(WorkflowRun.id == run_uuid))
-    run = result.scalar_one_or_none()
-
-    if not run:
-        raise HTTPException(status_code=404, detail="Workflow run not found.")
-
+    run = await _own_run(db, run_uuid, user)
+    failures = []
+    if run.status == "validation_failed":
+        report = (run.result_snapshot or {}).get("validation_report") or {}
+        failures = [{"code": c["code"], "name": c["name"], "message": c["message"]}
+                    for c in report.get("checks", []) if not c.get("passed") and c.get("severity") == "error"]
     return StatusResponse(
         run_id=str(run.id),
         status=run.status,
         current_step=run.current_step,
         student_id=str(run.student_id) if run.student_id else None,
+        validation_failures=failures,
     )
 
 
@@ -438,6 +331,7 @@ async def get_workflow_status(
 )
 async def get_resume_perfection(
     run_id: str,
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -450,10 +344,7 @@ async def get_resume_perfection(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid run_id format.")
 
-    result = await db.execute(select(WorkflowRun).where(WorkflowRun.id == run_uuid))
-    run = result.scalar_one_or_none()
-    if not run:
-        raise HTTPException(status_code=404, detail="Workflow run not found.")
+    run = await _own_run(db, run_uuid, user)
 
     snapshot = run.result_snapshot or {}
     perf_data = snapshot.get("resume_perfection")
@@ -493,6 +384,7 @@ async def get_resume_perfection(
 async def submit_resume_perfection_answers(
     run_id: str,
     payload: ResumePerfectionSubmitRequest,
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -504,10 +396,7 @@ async def submit_resume_perfection_answers(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid run_id format.")
 
-    result = await db.execute(select(WorkflowRun).where(WorkflowRun.id == run_uuid))
-    run = result.scalar_one_or_none()
-    if not run:
-        raise HTTPException(status_code=404, detail="Workflow run not found.")
+    run = await _own_run(db, run_uuid, user)
 
     snapshot = run.result_snapshot or {}
     perf_data = snapshot.get("resume_perfection") or {}
@@ -575,6 +464,7 @@ async def submit_resume_perfection_answers(
 )
 async def regenerate_resume_perfection(
     run_id: str,
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Regenerates a fresh set of questions based on resume content."""
@@ -583,10 +473,7 @@ async def regenerate_resume_perfection(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid run_id format.")
 
-    result = await db.execute(select(WorkflowRun).where(WorkflowRun.id == run_uuid))
-    run = result.scalar_one_or_none()
-    if not run:
-        raise HTTPException(status_code=404, detail="Workflow run not found.")
+    run = await _own_run(db, run_uuid, user)
 
     snapshot = run.result_snapshot or {}
     student_profile = snapshot.get("student_profile", {})

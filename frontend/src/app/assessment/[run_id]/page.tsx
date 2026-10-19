@@ -14,7 +14,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import { PBButton } from "@/components/ui/pb-button";
-import { getWorkflowStatus, ResumePerfectionEvaluation } from "@/lib/api";
+import { getSessionUser, getWorkflowStatus, ResumePerfectionEvaluation } from "@/lib/api";
 import { ResumePerfectionCard } from "@/components/resume/resume-perfection-card";
 import Link from "next/link";
 
@@ -24,12 +24,17 @@ export default function AssessmentStatusPage() {
   const runId = params.run_id as string;
 
   const [status, setStatus] = useState<string | null>(null);
+  const [failures, setFailures] = useState<{ code: string; name: string; message: string }[]>([]);
   const [currentStep, setCurrentStep] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [perfectionEvaluation, setPerfectionEvaluation] = useState<ResumePerfectionEvaluation | null>(null);
 
   useEffect(() => {
     if (!runId) return;
+    if (!getSessionUser()) {
+      router.replace(`/login?next=/assessment/${runId}`);
+      return;
+    }
 
     let intervalId: NodeJS.Timeout;
 
@@ -39,12 +44,14 @@ export default function AssessmentStatusPage() {
 
         setStatus(response.status);
         setCurrentStep(response.current_step || null);
+        setFailures(response.validation_failures || []);
 
         // Stop polling on terminal states
         if (
           response.status === "published" ||
           response.status === "approved" ||
-          response.status === "rejected"
+          response.status === "rejected" ||
+          response.status === "validation_failed"
         ) {
           if (intervalId) clearInterval(intervalId);
         }
@@ -60,7 +67,7 @@ export default function AssessmentStatusPage() {
 
     // Poll every 3 seconds if not in a terminal state
     intervalId = setInterval(() => {
-      if (status !== "published" && status !== "rejected" && status !== "approved") {
+      if (status !== "published" && status !== "rejected" && status !== "approved" && status !== "validation_failed") {
         checkStatus();
       } else {
         clearInterval(intervalId);
@@ -100,6 +107,33 @@ export default function AssessmentStatusPage() {
               {(currentStep || "Initializing").replace(/_/g, " ")}
             </span>
           </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (status === "validation_failed") {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-ivory p-6">
+        <div className="flex flex-col items-center gap-6 mt-10 max-w-md text-center">
+          <div className="w-20 h-20 rounded-[20px] bg-warning-light/40 flex items-center justify-center">
+            <XCircle className="w-10 h-10 text-warning" />
+          </div>
+          <h2 className="type-h2 text-charcoal">Not sent for review</h2>
+          <p className="text-sm text-bronze-dark/60">
+            Your analysis did not pass the required quality checks, so it was not sent to the Placement Officer.
+          </p>
+          <ul className="text-left text-sm space-y-2 w-full">
+            {failures.map((f) => (
+              <li key={f.code} className="p-3 rounded-[10px] bg-surface-warm border border-border-subtle">
+                <span className="font-semibold text-charcoal">{f.name}:</span>{" "}
+                <span className="text-bronze-dark/70">{f.message}</span>
+              </li>
+            ))}
+          </ul>
+          <PBButton onClick={() => router.push("/onboarding")} variant="primary" className="mt-2">
+            Try again
+          </PBButton>
         </div>
       </div>
     );

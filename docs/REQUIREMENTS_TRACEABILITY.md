@@ -2,6 +2,40 @@
 
 > Placement Readiness & Career Intelligence Portal — Chapter 9 Specification
 
+## Implementation status (2026-10-20)
+
+Each Chapter 9 requirement → where it is implemented → how it is verified. The detailed matrix further down is the original plan; the table here is the current state.
+
+| Chapter 9 | Requirement | Implementation | Verified by | Status |
+|-----------|-------------|----------------|-------------|--------|
+| §9.2 / §9.3 | Upload resume; link coding + academic accounts with consent **per source** | `POST /consents/me/grant`, `POST /process/upload` (409 without resume consent); `services/consent.py` | `test_gap_fixes.py` consent tests | ✅ |
+| §9.4 Resume Agent | Structured profile; validate consent first; flag inconsistent entries | `agents/resume_agent.py`; consent node before parsing; duplicate-resume check | `test_resume_validation.py` | ✅ |
+| §9.4 Skill Gap Agent | Approved benchmarks, cite each source, never label "unfit" | `agents/skill_gap_agent.py` + benchmark library; `SKILL_GAP_CITATION` check | `test_pipeline_contract.py` | ✅ |
+| §9.4 Coding Analytics | Authorized integrations only; trends not raw submissions | `connectors/coding_connector.py` (consent-checked GitHub/LeetCode) | `test_gap_fixes.py` | ✅ |
+| §9.8 | Skill Gap ‖ Coding Analytics in parallel, join before matching | `agents/graph.py` fan-out / `join_parallel` | `test_lab7_smoke.py` | ✅ |
+| §9.4 Job Matching | Score + ranked matches with confidence & reasoning; low confidence → human | `agents/job_matching_agent.py` over database drives; `LOW_CONFIDENCE_FLAGGED`; flagged in officer report | `test_gap_fixes.py` | ✅ |
+| §9.4 Interview Agent | Mock-interview practice + roadmap; AI feedback marked; recordings private | `agents/interview_agent.py`; `POST /interviews/practice` (answers not stored); roadmap download | `test_gap_fixes.py` (practice) | ✅ |
+| §9.4 Convener review | Officer approves / edits / overrides; final authority | `/approvals/{id}/decide`, `/edit`, `/override` (placement_officer only) | `test_gap_fixes.py` | ✅ |
+| §9.7 Validation | Gaps cited; eligibility enforced; no application without consent; bias check | `agents/validation_agent.py` (19 checks incl. `ELIGIBILITY_ENFORCED`, `NO_APPLICATION_WITHOUT_CONSENT`, `BIAS_CHECK`) | `test_pipeline_contract.py` | ✅ |
+| §9.7 Connector | One governed surface for profiles, requirements, assessments | `connectors/hub.py` | `tests/fakes.py` swap | ✅ |
+| §9.9 Dashboard | Score + signals, cited gaps, matches w/ confidence, roadmap + mock plan | Officer console inline report; student dashboard | Browser check | ✅ |
+| §9.11 Pilot | Intake form; benchmark library 5–8 roles; coding connector; exportable roadmap | `/onboarding`; 10 seeded roles; coding connector; "Download roadmap" | — | ✅ |
+| §9.12 | No release without review; never expose one student's data to another | Only `pending_review` runs reach the queue; chat / evidence / status / versions / preparedness scoped to owner | `test_gap_fixes.py` access tests | ✅ |
+| §9.12 | Keep benchmarks and company requirements current | Drives editable by officers; benchmark editor (`/benchmarks`, Placement Cell console tab), audited | `test_benchmarks.py` | ✅ |
+| Lab 1 | ≥2 clarifying questions, editable plan, revise on feedback | `POST /planner/clarify` | `test_gap_fixes.py` | ✅ |
+| Lab 4 | Tag + similarity retrieval over store and history | KB tag filters + full-text + sentence-embedding re-rank (local model); similar prior students (anonymised) | `test_gap_fixes.py`, `test_semantic_similarity.py` | ✅ |
+| Lab 6 | Audit every step; resume from checkpoint after crash | Audit log; SQLite checkpointer; resume on startup and via `/workflows/{id}/resume` | `test_checkpoint_resume.py` | ✅ |
+| Lab 8 | Parallel workers + merge by plan alignment | Batch re-run; per-student best-of-N roadmap candidates selected by plan alignment | `test_gap_fixes.py`, `test_checkpoint_resume.py` | ✅ |
+| Lab 10 | Diagnose and regenerate only the failing part; escalate | `agents/self_healing.py` | `test_lab10.py` | ✅ |
+| Lab 11 | Nothing reaches the officer without a green report | `validation_failed` runs never queued | `test_gap_fixes.py` | ✅ |
+| Lab 12 | Officer-only publish; versioned; one-click rollback; confidentiality | `_publish`, `POST /versions/{id}/rollback` (re-validated), server-side logout, admin account control | `test_gap_fixes.py` | ✅ |
+| Lab 13 | Role-family specialists with checkable output | `core/domains/specialists.py`, `SPECIALIST_OUTPUT_VALID` | `test_gap_fixes.py` | ✅ |
+| Lab 14 | Request → approved, published plan in one session, with dashboard + audit | Student → officer → publish flow; `/admin` audit log | Full suite + browser check | ✅ |
+
+---
+
+## Original planning matrix
+
 ## Document Conventions
 
 - **REQ-XX**: Requirement identifier

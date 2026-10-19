@@ -11,6 +11,7 @@ import {
   ArrowLeft,
   Code2,
   ShieldCheck,
+  Mic,
 } from "lucide-react";
 
 const navItems = [
@@ -18,6 +19,7 @@ const navItems = [
   { key: "perfection", label: "Resume Perfection", icon: ShieldCheck, href: "#perfection" },
   { key: "companies", label: "Company Matches", icon: Building2, href: "#companies" },
   { key: "roadmap", label: "Learning Roadmap", icon: Map, href: "#roadmap" },
+  { key: "mock", label: "Mock Interview", icon: Mic, href: "#mock" },
   { key: "skills", label: "Skills & Profile", icon: User, href: "#skills" },
   { key: "coding", label: "Code Practice", icon: Code2, href: "#coding" },
 ];

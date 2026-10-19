@@ -53,7 +53,7 @@ class ApprovalQueueItem(BaseModel):
 
 @router.get("/queue", response_model=List[ApprovalQueueItem])
 async def get_approval_queue(
-    current_user: User = Depends(require_role("placement_officer", "admin")),
+    current_user: User = Depends(require_role("placement_officer")),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -77,88 +77,21 @@ async def get_approval_queue(
     ]
 
 
-@router.post("/{workflow_run_id}", response_model=ApprovalResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/{workflow_run_id}", status_code=status.HTTP_201_CREATED)
 async def submit_approval(
     workflow_run_id: uuid.UUID,
     request: ApprovalRequest,
-    current_user: User = Depends(require_role("placement_officer", "admin")),
+    current_user: User = Depends(require_role("placement_officer")),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Submit an approval decision (approve / reject / request changes).
-    Only placement officers and admins may call this.
-
-    - approved         → workflow publishes; triggers Version creation
-    - rejected         → workflow marked rejected; student notified
-    - changes_requested → workflow returned for amendments
+    Older decision route. It applies exactly the same rules as /decide (validation
+    gate, officer-only); edits must go through /edit so they are re-validated.
     """
-    # Validate decision value
-    valid_decisions = {"approved", "rejected", "changes_requested"}
-    if request.decision not in valid_decisions:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Invalid decision '{request.decision}'. Must be one of: {valid_decisions}",
-        )
-
-    # Verify the workflow run exists
-    result = await db.execute(select(WorkflowRun).where(WorkflowRun.id == workflow_run_id))
-    run = result.scalar_one_or_none()
-    if not run:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow run not found")
-
-    # Prevent duplicate approvals on a run that is already decided
-    existing = await db.execute(
-        select(ApprovalDecision).where(
-            ApprovalDecision.workflow_run_id == workflow_run_id,
-            ApprovalDecision.decision.in_(["approved", "rejected"])
-        )
-    )
-    if existing.scalar_one_or_none():
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="This workflow run already has a final approval decision.",
-        )
-
-    # Record the decision
-    approval = ApprovalDecision(
-        workflow_run_id=workflow_run_id,
-        reviewer_id=current_user.id,
-        decision=request.decision,
-        comments=request.comments,
-        edits=request.edits,
-        reviewed_at=datetime.now(timezone.utc),
-    )
-    db.add(approval)
-
-    # Update workflow run status
-    run.status = request.decision  # "approved" / "rejected" / "changes_requested"
-
-    # Write audit log entry
-    audit = AuditLog(
-        actor_id=current_user.id,
-        actor_type="placement_officer",
-        workflow_run_id=workflow_run_id,
-        action="approval_decision",
-        entity_type="workflow_run",
-        entity_id=workflow_run_id,
-        decision=request.decision,
-        approval_decision=request.decision,
-        correlation_id=uuid.uuid4(),
-        details={"comments": request.comments, "edits_applied": bool(request.edits)},
-    )
-    db.add(audit)
-
-    await db.commit()
-    await db.refresh(approval)
-
-    return ApprovalResponse(
-        approval_id=approval.id,
-        workflow_run_id=workflow_run_id,
-        decision=approval.decision,
-        comments=approval.comments,
-        reviewed_by=current_user.full_name,
-        reviewed_at=approval.reviewed_at.isoformat(),
-    )
+    if request.decision not in {"approved", "rejected"}:
+        raise HTTPException(status_code=422, detail="Use 'approved' or 'rejected' (edits go through /edit).")
+    return await decide_run(workflow_run_id, MVPDecisionRequest(decision=request.decision, comments=request.comments),
+                            current_user, db)
 
 
 @router.get("/{workflow_run_id}", response_model=List[ApprovalResponse])
@@ -171,6 +104,10 @@ async def get_approval_history(
     Get all approval decisions for a specific workflow run.
     Students can read their own approval history; officers can read all.
     """
+    from app.api.deps import can_view_run
+    run = (await db.execute(select(WorkflowRun).where(WorkflowRun.id == workflow_run_id))).scalar_one_or_none()
+    if run is None or not await can_view_run(db, current_user, run):
+        raise HTTPException(status_code=404, detail="Workflow run not found")
     result = await db.execute(
         select(ApprovalDecision, User)
         .join(User, ApprovalDecision.reviewer_id == User.id)
@@ -193,84 +130,99 @@ async def get_approval_history(
 
 
 # ---------------------------------------------------------------------------
-# MVP Unauthenticated Endpoints (for frontend without login)
-# 
-# SECURITY WARNING: These endpoints are currently unauthenticated to facilitate
-# frontend testing and demonstration of the Officer Workflow. 
-# 
-# FUTURE REQUIREMENT: Before production, these endpoints MUST be secured
-# using `Depends(require_role("placement_officer"))` to ensure that students
-# cannot bypass human approval by calling these endpoints directly.
-# The conceptual separation between Student and Officer actions is maintained
-# structurally, but proper JWT validation is required for true security.
+# Placement Cell console endpoints (used by the officer page)
+#
+# Every endpoint requires an authenticated user with the placement_officer role.
+# Only runs that passed validation are in the queue, and only the officer can
+# approve, edit, override or reject. Students and agents cannot reach these.
 # ---------------------------------------------------------------------------
+
+def _validation(run: WorkflowRun) -> Dict[str, Any]:
+    return (run.result_snapshot or {}).get("validation_report") or {}
+
+
+def _failing(report: Dict[str, Any], severity: str) -> List[str]:
+    return [c["code"] for c in report.get("checks", []) if not c.get("passed") and c.get("severity") == severity]
+
+
+async def _get_run(db: AsyncSession, run_id: uuid.UUID) -> WorkflowRun:
+    run = (await db.execute(select(WorkflowRun).where(WorkflowRun.id == run_id))).scalar_one_or_none()
+    if not run:
+        raise HTTPException(status_code=404, detail="Workflow run not found.")
+    return run
+
 
 @router.get("/queue/open")
 async def get_open_approval_queue(
+    officer: User = Depends(require_role("placement_officer")),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    MVP: Get all workflow runs awaiting officer review (no auth required).
-    Returns pending_review and completed runs for the officer console.
-    
-    SECURITY REQUIREMENT: To be locked down with `require_role("placement_officer")`
-    in Phase 3 / Production.
-    """
-    result = await db.execute(
-        select(WorkflowRun)
-        .where(WorkflowRun.status.in_(["pending_review", "completed"]))
-        .order_by(WorkflowRun.created_at.desc())
-        .limit(50)
-    )
-    runs = result.scalars().all()
-
-    # Get recent decisions
-    decisions_result = await db.execute(
-        select(ApprovalDecision)
-        .order_by(ApprovalDecision.reviewed_at.desc())
-        .limit(10)
-    )
-    recent_decisions = decisions_result.scalars().all()
-
-    # Get counts
+    """Runs awaiting review (validation already passed), recent decisions and counts."""
     from sqlalchemy import func
-    approved_count_result = await db.execute(
-        select(func.count(ApprovalDecision.id)).where(ApprovalDecision.decision == "approved")
-    )
-    approved_count = approved_count_result.scalar() or 0
+    from app.models.user import Student
+    from app.models.workflow import Version
 
-    rejected_count_result = await db.execute(
-        select(func.count(ApprovalDecision.id)).where(ApprovalDecision.decision == "rejected")
-    )
-    rejected_count = rejected_count_result.scalar() or 0
+    runs = (await db.execute(
+        select(WorkflowRun).where(WorkflowRun.status == "pending_review")
+        .order_by(WorkflowRun.created_at.desc()).limit(50)
+    )).scalars().all()
+    names = dict((await db.execute(
+        select(Student.id, User.full_name).join(User, User.id == Student.user_id)
+        .where(Student.id.in_([r.student_id for r in runs] or [uuid.uuid4()]))
+    )).all())
 
-    total_runs_result = await db.execute(select(func.count(WorkflowRun.id)))
-    total_runs = total_runs_result.scalar() or 0
+    recent_decisions = (await db.execute(
+        select(ApprovalDecision).order_by(ApprovalDecision.reviewed_at.desc()).limit(10)
+    )).scalars().all()
 
-    published_result = await db.execute(
-        select(func.count(WorkflowRun.id)).where(WorkflowRun.status == "published")
-    )
-    published_count = published_result.scalar() or 0
+    # For each approved decision, find the student's previous version so the UI can offer rollback
+    rollback_targets: Dict[uuid.UUID, Optional[str]] = {}
+    for d in recent_decisions:
+        if d.decision not in ("approved", "override"):
+            continue
+        current = (await db.execute(select(Version).where(Version.workflow_run_id == d.workflow_run_id)
+                                    .order_by(Version.version_number.desc()).limit(1))).scalar_one_or_none()
+        if current is None:
+            continue
+        previous = (await db.execute(select(Version).where(
+            Version.student_id == current.student_id, Version.entity_type == current.entity_type,
+            Version.version_number < current.version_number, Version.status != "rolled_back",
+        ).order_by(Version.version_number.desc()).limit(1))).scalar_one_or_none()
+        if previous is not None and current.status == "published":
+            rollback_targets[d.workflow_run_id] = str(previous.id)
+
+    counts = dict((await db.execute(
+        select(ApprovalDecision.decision, func.count(ApprovalDecision.id)).group_by(ApprovalDecision.decision)
+    )).all())
+    approved_count = counts.get("approved", 0) + counts.get("override", 0)
+    rejected_count = counts.get("rejected", 0)
+    total_runs = (await db.execute(select(func.count(WorkflowRun.id)))).scalar() or 0
+    published_count = (await db.execute(
+        select(func.count(WorkflowRun.id)).where(WorkflowRun.status == "published"))).scalar() or 0
+    failed_count = (await db.execute(
+        select(func.count(WorkflowRun.id)).where(WorkflowRun.status == "validation_failed"))).scalar() or 0
+
+    def perf(r, key):
+        ev = ((r.result_snapshot or {}).get("resume_perfection") or {}).get("evaluation")
+        return ev.get(key) if ev else None
 
     return {
         "pending_runs": [
             {
                 "run_id": str(r.id),
                 "student_id": str(r.student_id),
+                "student_name": names.get(r.student_id),
                 "status": r.status,
                 "current_step": r.current_step,
                 "submitted_at": r.completed_at.isoformat() if r.completed_at else (r.created_at.isoformat() if r.created_at else None),
                 "created_at": r.created_at.isoformat() if r.created_at else None,
-                "resume_perfection_score": (
-                    (r.result_snapshot or {}).get("resume_perfection", {}).get("evaluation", {}).get("overall_score")
-                    if (r.result_snapshot or {}).get("resume_perfection", {}).get("evaluation")
-                    else None
-                ),
-                "resume_perfection_tier": (
-                    (r.result_snapshot or {}).get("resume_perfection", {}).get("evaluation", {}).get("tier_label")
-                    if (r.result_snapshot or {}).get("resume_perfection", {}).get("evaluation")
-                    else None
-                ),
+                "resume_perfection_score": perf(r, "overall_score"),
+                "resume_perfection_tier": perf(r, "tier_label"),
+                "target_roles": (r.result_snapshot or {}).get("target_roles", []),
+                "checks_passed": _validation(r).get("passed_checks"),
+                "total_checks": _validation(r).get("total_checks"),
+                "warnings": _failing(_validation(r), "warning"),
+                "gaps": [g.get("skill") for g in ((r.result_snapshot or {}).get("skill_gap_report") or {}).get("gaps", [])][:12],
             }
             for r in runs
         ],
@@ -280,12 +232,14 @@ async def get_open_approval_queue(
                 "decision": d.decision.upper(),
                 "decided_at": d.reviewed_at.isoformat() if d.reviewed_at else None,
                 "comments": d.comments,
+                "rollback_to_version_id": rollback_targets.get(d.workflow_run_id),
             }
             for d in recent_decisions
         ],
         "stats": {
             "total_runs": total_runs,
             "pending_reviews": len(runs),
+            "validation_failed": failed_count,
             "approval_rate_percent": round((approved_count / max(approved_count + rejected_count, 1)) * 100, 1),
             "published_versions": published_count,
         },
@@ -295,26 +249,18 @@ async def get_open_approval_queue(
 @router.get("/{workflow_run_id}/report")
 async def get_run_report(
     workflow_run_id: uuid.UUID,
+    officer: User = Depends(require_role("placement_officer")),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    MVP: Get the result_snapshot for a workflow run (officer review).
-    No authentication required for MVP.
-
-    SECURITY REQUIREMENT: To be locked down with `require_role("placement_officer")`
-    in Phase 3 / Production.
-    """
-    result = await db.execute(select(WorkflowRun).where(WorkflowRun.id == workflow_run_id))
-    run = result.scalar_one_or_none()
-    if not run:
-        raise HTTPException(status_code=404, detail="Workflow run not found.")
-
+    """The assembled draft and its validation report for officer review."""
+    run = await _get_run(db, workflow_run_id)
     return {
         "run_id": str(run.id),
         "student_id": str(run.student_id),
         "status": run.status,
         "current_step": run.current_step,
         "result_snapshot": run.result_snapshot,
+        "validation_report": _validation(run),
         "created_at": run.created_at.isoformat() if run.created_at else None,
         "completed_at": run.completed_at.isoformat() if run.completed_at else None,
     }
@@ -325,173 +271,166 @@ class MVPDecisionRequest(BaseModel):
     comments: Optional[str] = None
 
 
+class EditRequest(BaseModel):
+    officer_note: Optional[str] = None
+    gap_recommendations: Optional[Dict[str, str]] = None  # {skill: new recommendation}
+
+
+class OverrideRequest(BaseModel):
+    reason: str
+    comments: Optional[str] = None
+
+
+async def _publish(db: AsyncSession, run: WorkflowRun, officer: User, decision: str,
+                   comments: Optional[str], extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Approve the run and publish its assembled draft as a new Version."""
+    from sqlalchemy import func
+    from app.models.workflow import Version
+
+    correlation_id = uuid.uuid4()
+    approval = ApprovalDecision(workflow_run_id=run.id, reviewer_id=officer.id, decision=decision,
+                                comments=comments, edits=extra, reviewed_at=datetime.now(timezone.utc))
+    db.add(approval)
+    next_version_number = ((await db.execute(select(func.max(Version.version_number)).where(
+        Version.student_id == run.student_id, Version.entity_type == "readiness_plan"))).scalar() or 0) + 1
+    # Earlier published plans for this student are archived (kept for rollback)
+    for v in (await db.execute(select(Version).where(
+            Version.student_id == run.student_id, Version.entity_type == "readiness_plan",
+            Version.status == "published"))).scalars().all():
+        v.status = "archived"
+    version = Version(
+        student_id=run.student_id, entity_type="readiness_plan", version_number=next_version_number,
+        status="published", snapshot=run.result_snapshot, workflow_run_id=run.id, approved_by=officer.id,
+        published_at=datetime.now(timezone.utc),
+    )
+    db.add(version)
+    run.status = "published"
+    for action in ("OFFICER_OVERRIDE" if decision == "override" else "OFFICER_APPROVED", "VERSION_CREATED", "RESULT_PUBLISHED"):
+        db.add(AuditLog(
+            actor_id=officer.id, actor_type="placement_officer", workflow_run_id=run.id, action=action,
+            entity_type="workflow_run", entity_id=run.id, decision="approved", approval_decision=decision,
+            version=next_version_number, correlation_id=correlation_id,
+            details={"comments": comments, **(extra or {})},
+        ))
+    await db.commit()
+    await db.refresh(approval)
+    return {"approval_id": str(approval.id), "workflow_run_id": str(run.id), "decision": decision,
+            "version_number": next_version_number, "status": "published",
+            "message": "Result approved and published successfully."}
+
+
 @router.post("/{workflow_run_id}/decide")
 async def decide_run(
     workflow_run_id: uuid.UUID,
     request: MVPDecisionRequest,
+    officer: User = Depends(require_role("placement_officer")),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    MVP: Approve or reject a workflow run (no auth required).
-
-    SECURITY REQUIREMENT: Currently uses a generated demo officer. 
-    MUST be secured with `require_role("placement_officer")` so students 
-    cannot bypass the human-in-the-loop governance mechanism.
-
-    On APPROVE:
-    1. Sets WorkflowRun.status = "approved"
-    2. Creates ApprovalDecision record
-    3. Creates a published Version with the result_snapshot
-    4. Sets WorkflowRun.status = "published"
-    5. Writes AuditLog entries
-
-    On REJECT:
-    1. Sets WorkflowRun.status = "rejected"
-    2. Creates ApprovalDecision record
-    3. Writes AuditLog entry
+    Approve or reject a run. Only runs that passed validation (status pending_review)
+    can be decided. Approval also requires that no warning-level check failed —
+    otherwise the officer must use /override with a written reason.
     """
-    valid_decisions = {"approved", "rejected"}
-    if request.decision not in valid_decisions:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Invalid decision. Must be one of: {valid_decisions}",
-        )
-
-    # Get the workflow run
-    result = await db.execute(select(WorkflowRun).where(WorkflowRun.id == workflow_run_id))
-    run = result.scalar_one_or_none()
-    if not run:
-        raise HTTPException(status_code=404, detail="Workflow run not found.")
-
-    if run.status not in ("pending_review", "completed"):
-        raise HTTPException(
-            status_code=409,
-            detail=f"Cannot decide on a run with status '{run.status}'. Must be 'pending_review'.",
-        )
-
-    # Get or create demo officer
-    from app.api.v1.process import get_or_create_demo_officer
-    officer = await get_or_create_demo_officer(db)
-
-    correlation_id = uuid.uuid4()
-
-    # Create approval decision
-    approval = ApprovalDecision(
-        workflow_run_id=workflow_run_id,
-        reviewer_id=officer.id,
-        decision=request.decision,
-        comments=request.comments,
-        reviewed_at=datetime.now(timezone.utc),
-    )
-    db.add(approval)
+    if request.decision not in {"approved", "rejected"}:
+        raise HTTPException(status_code=422, detail="Invalid decision. Must be 'approved' or 'rejected'.")
+    run = await _get_run(db, workflow_run_id)
+    if run.status != "pending_review":
+        raise HTTPException(status_code=409, detail=f"Cannot decide on a run with status '{run.status}'.")
 
     if request.decision == "approved":
-        # 1. Mark as approved
-        run.status = "approved"
+        report = _validation(run)
+        if not report.get("passed"):
+            raise HTTPException(status_code=409, detail="This plan failed validation and cannot be approved.")
+        warnings = _failing(report, "warning")
+        if warnings:
+            raise HTTPException(status_code=409, detail=(
+                f"Warning checks failed ({', '.join(warnings)}). Edit the plan or use Override with a reason."))
+        return await _publish(db, run, officer, "approved", request.comments)
 
-        # 2. Create a published Version
-        from sqlalchemy import func
-        from app.models.workflow import Version
+    run.status = "rejected"
+    approval = ApprovalDecision(workflow_run_id=run.id, reviewer_id=officer.id, decision="rejected",
+                                comments=request.comments, reviewed_at=datetime.now(timezone.utc))
+    db.add(approval)
+    db.add(AuditLog(actor_id=officer.id, actor_type="placement_officer", workflow_run_id=run.id,
+                    action="OFFICER_REJECTED", entity_type="workflow_run", entity_id=run.id,
+                    decision="rejected", approval_decision="rejected", correlation_id=uuid.uuid4(),
+                    details={"comments": request.comments}))
+    await db.commit()
+    await db.refresh(approval)
+    return {"approval_id": str(approval.id), "workflow_run_id": str(run.id), "decision": "rejected",
+            "status": "rejected", "message": "Result rejected."}
 
-        count_result = await db.execute(
-            select(func.count(Version.id)).where(
-                Version.student_id == run.student_id,
-                Version.entity_type == "readiness_plan",
-            )
-        )
-        next_version_number = (count_result.scalar() or 0) + 1
 
-        version = Version(
-            student_id=run.student_id,
-            entity_type="readiness_plan",
-            version_number=next_version_number,
-            status="published",
-            snapshot=run.result_snapshot,
-            workflow_run_id=workflow_run_id,
-            approved_by=officer.id,
-            published_at=datetime.now(timezone.utc),
-        )
-        db.add(version)
+@router.post("/{workflow_run_id}/edit")
+async def edit_run(
+    workflow_run_id: uuid.UUID,
+    request: EditRequest,
+    officer: User = Depends(require_role("placement_officer")),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Officer edit: add a reviewer note and/or rewrite gap recommendations.
+    The edited plan is validated again; if it fails it leaves the queue.
+    """
+    import copy
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.agents.validation_agent import validation_agent_node
 
-        # 3. Update run to published
-        run.status = "published"
+    run = await _get_run(db, workflow_run_id)
+    if run.status not in ("pending_review", "validation_failed"):
+        raise HTTPException(status_code=409, detail=f"Cannot edit a run with status '{run.status}'.")
+    snapshot = copy.deepcopy(run.result_snapshot or {})
+    changes = []
+    if request.officer_note and request.officer_note.strip():
+        snapshot.setdefault("officer_notes", []).append(
+            {"by": officer.full_name, "at": datetime.now(timezone.utc).isoformat(), "note": request.officer_note.strip()})
+        changes.append({"field": "officer_notes", "after": request.officer_note.strip()})
+    for skill, text in (request.gap_recommendations or {}).items():
+        gap = next((g for g in (snapshot.get("skill_gap_report") or {}).get("gaps", []) if g.get("skill") == skill), None)
+        if gap is None:
+            raise HTTPException(status_code=422, detail=f"No gap named '{skill}' in this plan.")
+        changes.append({"field": f"gap:{skill}", "before": gap.get("recommendation"), "after": text.strip()})
+        gap["recommendation"] = text.strip()
+        gap["edited_by_officer"] = True
+    if not changes:
+        raise HTTPException(status_code=422, detail="Nothing to edit.")
 
-        # 4. Audit logs
-        audit_approve = AuditLog(
-            actor_id=officer.id,
-            actor_type="placement_officer",
-            workflow_run_id=workflow_run_id,
-            action="OFFICER_APPROVED",
-            entity_type="workflow_run",
-            entity_id=workflow_run_id,
-            decision="approved",
-            approval_decision="approved",
-            correlation_id=correlation_id,
-            details={"comments": request.comments},
-        )
-        db.add(audit_approve)
+    report = validation_agent_node(snapshot)["validation_report"]
+    snapshot["validation_report"] = report
+    snapshot.setdefault("metadata", {})["validation_passed"] = report["passed"]
+    run.result_snapshot = snapshot
+    flag_modified(run, "result_snapshot")
+    run.status = "pending_review" if report["passed"] else "validation_failed"
+    db.add(ApprovalDecision(workflow_run_id=run.id, reviewer_id=officer.id, decision="edited",
+                            edits={"changes": changes}, reviewed_at=datetime.now(timezone.utc)))
+    db.add(AuditLog(actor_id=officer.id, actor_type="placement_officer", workflow_run_id=run.id,
+                    action="OFFICER_EDITED", entity_type="workflow_run", entity_id=run.id,
+                    correlation_id=uuid.uuid4(), details={"changes": changes, "validation_passed": report["passed"]}))
+    await db.commit()
+    return {"workflow_run_id": str(run.id), "status": run.status, "changes": changes,
+            "validation_passed": report["passed"],
+            "failing_checks": [c["code"] for c in report["checks"] if not c["passed"]]}
 
-        audit_version = AuditLog(
-            actor_id=officer.id,
-            actor_type="placement_officer",
-            workflow_run_id=workflow_run_id,
-            action="VERSION_CREATED",
-            entity_type="version",
-            version=next_version_number,
-            correlation_id=correlation_id,
-            details={"version_number": next_version_number, "status": "published"},
-        )
-        db.add(audit_version)
 
-        audit_publish = AuditLog(
-            actor_id=officer.id,
-            actor_type="placement_officer",
-            workflow_run_id=workflow_run_id,
-            action="RESULT_PUBLISHED",
-            entity_type="workflow_run",
-            entity_id=workflow_run_id,
-            correlation_id=correlation_id,
-            details={"version_number": next_version_number},
-        )
-        db.add(audit_publish)
-
-        await db.commit()
-        await db.refresh(approval)
-
-        return {
-            "approval_id": str(approval.id),
-            "workflow_run_id": str(workflow_run_id),
-            "decision": "approved",
-            "version_number": next_version_number,
-            "status": "published",
-            "message": "Result approved and published successfully.",
-        }
-
-    else:  # rejected
-        run.status = "rejected"
-
-        audit_reject = AuditLog(
-            actor_id=officer.id,
-            actor_type="placement_officer",
-            workflow_run_id=workflow_run_id,
-            action="OFFICER_REJECTED",
-            entity_type="workflow_run",
-            entity_id=workflow_run_id,
-            decision="rejected",
-            approval_decision="rejected",
-            correlation_id=correlation_id,
-            details={"comments": request.comments},
-        )
-        db.add(audit_reject)
-
-        await db.commit()
-        await db.refresh(approval)
-
-        return {
-            "approval_id": str(approval.id),
-            "workflow_run_id": str(workflow_run_id),
-            "decision": "rejected",
-            "status": "rejected",
-            "message": "Result rejected.",
-        }
-
+@router.post("/{workflow_run_id}/override")
+async def override_run(
+    workflow_run_id: uuid.UUID,
+    request: OverrideRequest,
+    officer: User = Depends(require_role("placement_officer")),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Officer override: publish a plan whose only failed checks are warnings, with a
+    written reason (min 20 characters) recorded in the audit log. Error-level
+    checks (consent, grounding, eligibility, data isolation) can never be overridden.
+    """
+    run = await _get_run(db, workflow_run_id)
+    if run.status != "pending_review":
+        raise HTTPException(status_code=409, detail=f"Cannot override a run with status '{run.status}'.")
+    if len((request.reason or "").strip()) < 20:
+        raise HTTPException(status_code=422, detail="Give a reason of at least 20 characters for the override.")
+    report = _validation(run)
+    if not report.get("passed") or _failing(report, "error"):
+        raise HTTPException(status_code=409, detail="Error-level validation failures cannot be overridden.")
+    return await _publish(db, run, officer, "override", request.comments,
+                          {"override_reason": request.reason.strip(), "waived_checks": _failing(report, "warning")})

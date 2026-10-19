@@ -10,19 +10,26 @@ Architecture Contract:
 This is the quality gate that decides whether the readiness plan passes
 validation or needs to be sent back through the self-healing loop.
 
-Validation Checks (12):
-1.  SKILL_GAP_CITATION     — Recommendations cite specific skill gaps
-2.  ELIGIBILITY_ENFORCED   — Eligibility rules (GPA, experience) enforced
-3.  CONSENT_SATISFIED      — Required consents are granted
-4.  BIAS_CHECK             — Shortlisting checked for statistical bias (warning)
-5.  EVIDENCE_PRESENT       — Every match has evidence records
-6.  CONFIDENCE_PRESENT     — All matches have confidence scores
-7.  LOW_CONFIDENCE_FLAGGED — Low-confidence matches flagged for human review
-8.  SCHEMA_VALID           — Output conforms to required schemas
-9.  NO_MISSING_SECTIONS    — No required section is missing
-10. NO_CROSS_STUDENT_LEAK  — No cross-student information leakage
-11. NO_UNSUPPORTED_CLAIMS  — No unsupported claim presented as fact
-12. SCORE_BOUNDS           — Scores within valid ranges
+Validation Checks (18). Chapter 9 §9.7 names four acceptance checks — 1, 2, 3/13
+and 4 below — the rest guard grounding, provenance and governance:
+1.  SKILL_GAP_CITATION        — Recommendations cite the specific skill gaps (error)
+2.  ELIGIBILITY_ENFORCED      — Eligibility rules (CGPA, backlogs, experience) enforced (error)
+3.  CONSENT_SATISFIED         — Required source consents are granted (error)
+4.  BIAS_CHECK                — Shortlisting uses no protected attributes (error)
+5.  EVIDENCE_PRESENT          — Every section has evidence records (error)
+6.  CONFIDENCE_PRESENT        — All matches have confidence scores (error)
+7.  LOW_CONFIDENCE_FLAGGED    — Low-confidence matches flagged for human review (error)
+8.  SCHEMA_VALID              — Output conforms to required schemas (error)
+9.  NO_MISSING_SECTIONS       — No required section is missing (error)
+10. NO_CROSS_STUDENT_LEAK     — No cross-student information leakage (error)
+11. NO_UNSUPPORTED_CLAIMS     — Every match carries reasoning (error)
+12. SCORE_BOUNDS              — Scores within valid ranges (error)
+13. NO_APPLICATION_WITHOUT_CONSENT — Nothing was submitted on the student's behalf (error)
+14. REQUIREMENTS_VERIFIED     — Gaps are grounded in verified role requirements (error)
+15. SOURCE_PROVENANCE         — Coding statistics come only from sources that returned data (error)
+16. SPECIALIST_OUTPUT_VALID   — Domain specialist outputs passed schema validation (error)
+17. SHORTLIST_DISTRIBUTION    — All/none-eligible outcomes flagged for review (warning)
+18. RETRIEVAL_GROUNDED        — Roadmap items cite retrieved resources (warning)
 """
 from typing import Any, Dict, List, Tuple
 from datetime import datetime, timezone
@@ -133,15 +140,31 @@ def _check_eligibility_enforced(state: PlacementState) -> Dict[str, Any]:
 def _check_consent_satisfied(state: PlacementState) -> Dict[str, Any]:
     """
     CHECK 3: CONSENT_SATISFIED
-    Verify that required consents were validated before processing.
+    Required source consents (resume_processing, placement_matching) must be
+    `granted` in the consent snapshot read from the Consent table for this run.
     """
-    consent_validated = state.get("consent_validated", False)
+    from app.services.consent import missing_required
 
-    if not consent_validated:
+    if not state.get("consent_validated", False):
         return _check_result(
             "CONSENT_SATISFIED", "Required consents granted",
             False, "error", "Consent was not validated before pipeline execution."
         )
+    snapshot = state.get("consent_status")
+    if snapshot is not None:
+        missing = missing_required(snapshot)
+        if missing:
+            return _check_result(
+                "CONSENT_SATISFIED", "Required consents granted", False, "error",
+                f"Required consents not granted: {missing}"
+            )
+        # Coding data present without consent would be a violation
+        for src in ((state.get("coding_analytics") or {}).get("sources") or []):
+            if src.get("status") == "ok" and (snapshot.get(src.get("source")) or {}).get("status") != "granted":
+                return _check_result(
+                    "CONSENT_SATISFIED", "Required consents granted", False, "error",
+                    f"{src.get('source')} data used without a granted consent."
+                )
 
     return _check_result(
         "CONSENT_SATISFIED", "Required consents granted",
@@ -149,46 +172,175 @@ def _check_consent_satisfied(state: PlacementState) -> Dict[str, Any]:
     )
 
 
+PROTECTED_ATTRIBUTES = {
+    "gender", "sex", "religion", "caste", "category", "ethnicity", "race", "age", "date_of_birth", "dob",
+    "marital_status", "nationality", "disability", "photo", "full_name", "name",
+}
+
+
+def _scan_keys(obj: Any, found: set) -> None:
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if str(k).lower() in PROTECTED_ATTRIBUTES:
+                found.add(str(k).lower())
+            _scan_keys(v, found)
+    elif isinstance(obj, list):
+        for v in obj:
+            _scan_keys(v, found)
+
+
 def _check_bias(state: PlacementState) -> Dict[str, Any]:
     """
-    CHECK 4: BIAS_CHECK (warning severity)
-    Check for potential statistical bias in shortlisting.
-    This is a simplified check — production would use more sophisticated bias detection.
+    CHECK 4: BIAS_CHECK
+    Shortlisting must not use protected attributes: the scoring breakdown of every
+    match and the scoring configuration are scanned for protected fields.
     """
-    matching = state.get("matching_result")
-    if not matching:
+    matching = state.get("matching_result") or {}
+    found: set = set()
+    for m in matching.get("matches", []):
+        _scan_keys(m.get("breakdown", []), found)
+    _scan_keys(matching.get("scoring_config_used", {}), found)
+    if found:
         return _check_result(
-            "BIAS_CHECK", "Shortlisting bias check",
-            True, "warning", "No matching data to check for bias."
+            "BIAS_CHECK", "Shortlisting checked for bias", False, "error",
+            f"Protected attributes used in scoring: {sorted(found)}"
         )
-
-    matches = matching.get("matches", [])
-    eligible_count = sum(1 for m in matches if m.get("is_eligible", False))
-    total = len(matches)
-
-    # If ALL or NONE are eligible, flag as potentially biased (extreme outcomes)
-    if total > 0 and (eligible_count == 0 or eligible_count == total):
-        return _check_result(
-            "BIAS_CHECK", "Shortlisting bias check",
-            False, "warning",
-            f"Potential bias: {'all' if eligible_count == total else 'no'} candidates "
-            f"marked eligible ({eligible_count}/{total}). Review criteria."
-        )
-
-    # Check for suspiciously uniform scores
-    if matches:
-        scores = [m.get("match_percentage", 0) for m in matches]
-        if len(set(scores)) == 1 and len(scores) > 1:
-            return _check_result(
-                "BIAS_CHECK", "Shortlisting bias check",
-                False, "warning",
-                "All match scores are identical — review scoring logic."
-            )
-
     return _check_result(
-        "BIAS_CHECK", "Shortlisting bias check",
-        True, "warning", f"Bias check passed. Eligible: {eligible_count}/{total}."
+        "BIAS_CHECK", "Shortlisting checked for bias", True, "error",
+        "Scoring uses only skills, coding activity, projects and published eligibility criteria."
     )
+
+
+def _check_shortlist_distribution(state: PlacementState) -> Dict[str, Any]:
+    """
+    CHECK 17: SHORTLIST_DISTRIBUTION (warning)
+    All-eligible or none-eligible outcomes are surfaced for the reviewer.
+    """
+    matches = (state.get("matching_result") or {}).get("matches", [])
+    if len(matches) < 2:
+        return _check_result("SHORTLIST_DISTRIBUTION", "Shortlist distribution reviewed", True, "warning",
+                             "Fewer than two listings — distribution check not applicable.")
+    eligible = sum(1 for m in matches if m.get("is_eligible"))
+    if eligible in (0, len(matches)):
+        return _check_result(
+            "SHORTLIST_DISTRIBUTION", "Shortlist distribution reviewed", False, "warning",
+            f"{'All' if eligible else 'No'} listings marked eligible ({eligible}/{len(matches)}). Review the criteria."
+        )
+    return _check_result("SHORTLIST_DISTRIBUTION", "Shortlist distribution reviewed", True, "warning",
+                         f"{eligible}/{len(matches)} listings eligible.")
+
+
+def _check_no_application_without_consent(state: PlacementState) -> Dict[str, Any]:
+    """
+    CHECK 13: NO_APPLICATION_WITHOUT_CONSENT
+    The system never submits applications; any submitted entry fails the gate.
+    """
+    matching = state.get("matching_result") or {}
+    submitted = list(matching.get("applications_submitted") or [])
+    submitted += [m for m in matching.get("matches", []) if m.get("application_status") not in (None, "not_submitted")]
+    if submitted:
+        return _check_result("NO_APPLICATION_WITHOUT_CONSENT", "No application submitted without the student's consent",
+                             False, "error", f"{len(submitted)} application(s) recorded as submitted by the system.")
+    return _check_result("NO_APPLICATION_WITHOUT_CONSENT", "No application submitted without the student's consent",
+                         True, "error", "No applications were submitted; students apply themselves.")
+
+
+def _check_requirements_verified(state: PlacementState) -> Dict[str, Any]:
+    """
+    CHECK 14: REQUIREMENTS_VERIFIED
+    Every gap must cite a requirement source, and at least one target role must
+    have verified requirements (benchmark library or job listing).
+    """
+    report = state.get("skill_gap_report") or {}
+    per_role = report.get("per_role")
+    if per_role is None:  # legacy report shape: only citation can be checked
+        ok = bool(report.get("citation") or all(g.get("benchmark_source") for g in report.get("gaps", [])))
+        return _check_result("REQUIREMENTS_VERIFIED", "Gaps grounded in verified requirements", ok, "error",
+                             "Gap sources present." if ok else "Gaps lack requirement sources.")
+    verified = [r for r in per_role if r.get("requirements_count")]
+    if not verified:
+        return _check_result(
+            "REQUIREMENTS_VERIFIED", "Gaps grounded in verified requirements", False, "error",
+            f"No verified requirements exist for the target roles {[r.get('title') for r in per_role]}. "
+            "Choose a catalogued role or ask the Placement Cell to add a benchmark or listing."
+        )
+    uncited = [g.get("skill") for g in report.get("gaps", []) if not g.get("benchmark_source")]
+    if uncited:
+        return _check_result("REQUIREMENTS_VERIFIED", "Gaps grounded in verified requirements", False, "error",
+                             f"Gaps without a requirement source: {uncited}")
+    return _check_result("REQUIREMENTS_VERIFIED", "Gaps grounded in verified requirements", True, "error",
+                         f"Verified requirements for {len(verified)}/{len(per_role)} target role(s).")
+
+
+def _check_source_provenance(state: PlacementState) -> Dict[str, Any]:
+    """
+    CHECK 15: SOURCE_PROVENANCE
+    Coding statistics must come only from sources that returned data, with a
+    retrieval timestamp. Unavailable sources must not contribute numbers.
+    """
+    ca = state.get("coding_analytics") or {}
+    sources = ca.get("sources")
+    if sources is None:
+        return _check_result("SOURCE_PROVENANCE", "Coding data provenance", True, "error",
+                             "Legacy coding analytics without per-source records.")
+    ok_sources = [s for s in sources if s.get("status") == "ok"]
+    summary = ca.get("summary") or {}
+    problems = []
+    for s in ok_sources:
+        if not s.get("retrieved_at"):
+            problems.append(f"{s.get('source')} has no retrieval time")
+    for s in sources:
+        if s.get("status") != "ok" and s.get("data"):
+            problems.append(f"{s.get('source')} is {s.get('status')} but carries data")
+    if summary.get("data_available") and not ok_sources:
+        problems.append("Statistics present but no source returned data")
+    if "total_solved" in summary and not any(s.get("source") == "leetcode" for s in ok_sources):
+        problems.append("LeetCode statistics present without a successful LeetCode retrieval")
+    if problems:
+        return _check_result("SOURCE_PROVENANCE", "Coding data provenance", False, "error", "; ".join(problems))
+    return _check_result("SOURCE_PROVENANCE", "Coding data provenance", True, "error",
+                         f"{len(ok_sources)} source(s) returned data; others are marked "
+                         f"{sorted({s.get('status') for s in sources if s.get('status') != 'ok'}) or 'n/a'}.")
+
+
+def _check_specialist_output(state: PlacementState) -> Dict[str, Any]:
+    """
+    CHECK 16: SPECIALIST_OUTPUT_VALID
+    If domain specialists were selected, at least one validated output must exist
+    and none may be silently dropped.
+    """
+    sa = state.get("specialist_analysis")
+    if sa is None:
+        return _check_result("SPECIALIST_OUTPUT_VALID", "Domain specialist outputs validated", True, "error",
+                             "Specialists not part of this run.")
+    if sa.get("selected_domains") and not sa.get("specialists"):
+        return _check_result("SPECIALIST_OUTPUT_VALID", "Domain specialist outputs validated", False, "error",
+                             f"All specialist outputs were rejected: {sa.get('rejected_outputs')}")
+    for spec in sa.get("specialists", []):
+        if not spec.get("recommendations"):
+            return _check_result("SPECIALIST_OUTPUT_VALID", "Domain specialist outputs validated", False, "error",
+                                 f"{spec.get('name')} produced no recommendations.")
+    return _check_result("SPECIALIST_OUTPUT_VALID", "Domain specialist outputs validated", True, "error",
+                         f"{len(sa.get('specialists', []))} specialist output(s) validated"
+                         + (f"; rejected: {sa.get('rejected_outputs')}" if sa.get("rejected_outputs") else "."))
+
+
+def _check_retrieval_grounded(state: PlacementState) -> Dict[str, Any]:
+    """
+    CHECK 18: RETRIEVAL_GROUNDED (warning)
+    Roadmap gap items should cite a retrieved learning resource.
+    """
+    retrieval = state.get("retrieval")
+    items = [i for i in (state.get("roadmap") or {}).get("items", []) if i.get("resource_status") in ("cited", "no_resource_in_knowledge_base")]
+    if retrieval is not None and retrieval.get("status") == "unavailable":
+        return _check_result("RETRIEVAL_GROUNDED", "Recommendations cite retrieved resources", False, "warning",
+                             "Knowledge base was unavailable during this run.")
+    uncited = [i["skill"] for i in items if i.get("resource_status") != "cited"]
+    if uncited:
+        return _check_result("RETRIEVAL_GROUNDED", "Recommendations cite retrieved resources", False, "warning",
+                             f"No knowledge-base resource for: {uncited}")
+    return _check_result("RETRIEVAL_GROUNDED", "Recommendations cite retrieved resources", True, "warning",
+                         f"{len(items)} roadmap gap item(s) cite retrieved resources.")
 
 
 def _check_evidence_present(state: PlacementState) -> Dict[str, Any]:
@@ -227,7 +379,7 @@ def _check_evidence_present(state: PlacementState) -> Dict[str, Any]:
         required_types.add("skill_gap_report")
     if state.get("coding_analytics"):
         required_types.add("coding_analytics")
-    if state.get("matching_result"):
+    if (state.get("matching_result") or {}).get("matches"):
         required_types.add("company_match")
     if state.get("interview_result"):
         required_types.add("interview_preparation")
@@ -537,8 +689,8 @@ def _check_score_bounds(state: PlacementState) -> Dict[str, Any]:
 FAILURE_TO_AGENT_MAP = {
     "SKILL_GAP_CITATION": "skill_gap_agent",
     "ELIGIBILITY_ENFORCED": "job_matching_agent",
-    "CONSENT_SATISFIED": "consent_validation",
-    "EVIDENCE_PRESENT": "evidence_grounding",
+    "CONSENT_SATISFIED": None,   # never self-healed: the student must grant consent
+    "EVIDENCE_PRESENT": None,
     "CONFIDENCE_PRESENT": "job_matching_agent",
     "LOW_CONFIDENCE_FLAGGED": "job_matching_agent",
     "SCHEMA_VALID": "assemble_draft",
@@ -546,7 +698,14 @@ FAILURE_TO_AGENT_MAP = {
     "NO_CROSS_STUDENT_LEAK": None,  # System-level issue
     "NO_UNSUPPORTED_CLAIMS": "job_matching_agent",
     "SCORE_BOUNDS": "job_matching_agent",
+    "BIAS_CHECK": "job_matching_agent",
+    "NO_APPLICATION_WITHOUT_CONSENT": None,
+    "REQUIREMENTS_VERIFIED": None,      # needs a catalogued role or Placement Cell data
+    "SOURCE_PROVENANCE": "coding_analytics_agent",
+    "SPECIALIST_OUTPUT_VALID": None,
 }
+
+HEALABLE_AGENTS = {"skill_gap_agent", "coding_analytics_agent", "job_matching_agent", "interview_agent"}
 
 
 def _diagnose_failures(checks: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -562,7 +721,7 @@ def _diagnose_failures(checks: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     for check in failed_checks:
         target_agent = FAILURE_TO_AGENT_MAP.get(check["code"])
-        if target_agent:
+        if target_agent in HEALABLE_AGENTS:
             agents_to_regenerate.add(target_agent)
         else:
             unresolvable.append(check["code"])
@@ -584,10 +743,10 @@ def validation_agent_node(state: PlacementState) -> Dict[str, Any]:
     """
     LangGraph Node: Validation Agent.
 
-    Runs ALL 12 validation checks deterministically (zero LLM).
+    Runs all validation checks deterministically (zero LLM).
     Returns validation_report with pass/fail status and diagnosis for self-healing.
     """
-    logger.info("[ValidationAgent] Running 12 validation checks...")
+    logger.info("[ValidationAgent] Running validation checks...")
 
     # Run all 12 checks
     checks = [
@@ -603,6 +762,12 @@ def validation_agent_node(state: PlacementState) -> Dict[str, Any]:
         _check_no_cross_student_leak(state),     # 10
         _check_no_unsupported_claims(state),     # 11
         _check_score_bounds(state),              # 12
+        _check_no_application_without_consent(state),  # 13
+        _check_requirements_verified(state),     # 14
+        _check_source_provenance(state),         # 15
+        _check_specialist_output(state),         # 16
+        _check_shortlist_distribution(state),    # 17 (warning)
+        _check_retrieval_grounded(state),        # 18 (warning)
     ]
 
     # Compute aggregate results
@@ -657,6 +822,12 @@ def validation_agent_node(state: PlacementState) -> Dict[str, Any]:
         logger.info(f"[ValidationAgent] Failing checks: {failing_check_codes}")
         if diagnosis["can_self_heal"]:
             logger.info(f"[ValidationAgent] Self-healing targets: {diagnosis['agents_to_regenerate']}")
+
+    validation_report["explanation"] = [
+        {"code": c["code"], "name": c["name"], "severity": c["severity"], "message": c["message"],
+         "self_healable": FAILURE_TO_AGENT_MAP.get(c["code"]) in HEALABLE_AGENTS}
+        for c in checks if not c["passed"]
+    ]
 
     return {
         "validation_report": validation_report,

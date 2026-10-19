@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect } from "react";
 import { MessageCircle, X, Send, Bot, User, Loader2 } from "lucide-react";
-import { sendChatMessage } from "@/lib/api";
+import { getActiveRunId, getSessionUser, sendChatMessage } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 export function Chatbot() {
@@ -41,15 +41,24 @@ export function Chatbot() {
     const newMessages = [...messages, { role: "user", content: text }];
     setMessages(newMessages);
     setInput("");
+
+    // The assistant answers from the student's own plan, so it needs a student sign-in
+    const user = getSessionUser();
+    if (!user || user.role !== "student") {
+      setMessages([...newMessages, { role: "assistant", content: user
+        ? "The career assistant is for students. Use your console for Placement Cell work."
+        : "Please sign in as a student to chat — I answer from your own readiness plan." }]);
+      return;
+    }
     setIsLoading(true);
 
     try {
-      const runId = localStorage.getItem("active_run_id");
+      const runId = getActiveRunId();
       const { response } = await sendChatMessage(text, messages, runId);
       
       setMessages([...newMessages, { role: "assistant", content: response }]);
     } catch (error) {
-      console.error("Chat error:", error);
+      console.warn("Chat error:", error);
       setMessages([
         ...newMessages,
         { role: "assistant", content: "Sorry, I'm having trouble connecting right now. Please try again later." }

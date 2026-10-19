@@ -276,8 +276,7 @@ def test_validation_checks():
     passed = result.get("validation_passed", False)
     print(f"\n  Overall: {'PASSED' if passed else 'FAILED'}")
 
-    # Should pass all checks
-    assert report.get("total_checks") == 12, f"Expected 12 checks, got {report.get('total_checks')}"
+    assert report.get("total_checks") == 18, f"Expected 18 checks, got {report.get('total_checks')}"
     print("[PASS] Validation agent checks")
 
 
@@ -294,7 +293,7 @@ def test_graph_compilation():
     expected_nodes = [
         "plan_workflow", "lock_plan", "consent_validation", "resume_agent",
         "skill_gap_agent", "coding_analytics_agent", "join_parallel",
-        "job_matching_agent", "interview_agent",
+        "domain_specialists", "job_matching_agent", "interview_agent",
         "validation_agent", "diagnose_and_regenerate", "assemble_draft",
     ]
 
@@ -305,10 +304,13 @@ def test_graph_compilation():
 
 
 def test_skill_gap_agent_node():
-    """Test the skill gap agent node with mock state (no LLM)."""
+    """Skill gap node reads verified requirements through the connector hub."""
     from app.agents.skill_gap_agent import skill_gap_agent_node
+    from app.connectors.hub import registered_hub
+    from tests.fakes import FakeHub
 
     state = {
+        "run_id": "unit-sg",
         "student_profile": {
             "skills": [
                 {"name": "python", "proficiency": "advanced"},
@@ -319,80 +321,67 @@ def test_skill_gap_agent_node():
         "target_roles": ["software_engineer"],
         "consent_validated": True,
     }
+    hub = FakeHub(resources={"SQL": ("PostgreSQL Tutorial", "https://www.postgresql.org/docs/current/tutorial.html")})
+    with registered_hub("unit-sg", hub):
+        result = skill_gap_agent_node(state)
 
-    result = skill_gap_agent_node(state)
-
-    assert "skill_gap_report" in result, "Missing skill_gap_report"
     report = result["skill_gap_report"]
-    assert "overall_coverage" in report, "Missing overall_coverage"
-    assert "strengths" in report, "Missing strengths"
-    assert "gaps" in report, "Missing gaps"
-    assert 0 <= report["overall_coverage"] <= 100, "Coverage out of range"
+    assert 0 <= report["overall_coverage"] <= 100
+    gap_skills = {g["skill"] for g in report["gaps"]}
+    assert gap_skills == {"SQL", "Docker"}
+    sql_gap = next(g for g in report["gaps"] if g["skill"] == "SQL")
+    assert "Benchmark v1" in sql_gap["recommendation"]
+    assert sql_gap["resources"][0]["url"].startswith("https://www.postgresql.org")
+    assert {g["importance"] for g in report["required_gaps"]} == {"required"}
 
-    print(f"[PASS] Skill gap agent - Coverage: {report['overall_coverage']}%, "
-          f"Gaps: {len(report['gaps'])}, Strengths: {len(report['strengths'])}")
+
+def test_skill_gap_agent_requires_target_roles():
+    from app.agents.skill_gap_agent import skill_gap_agent_node
+    result = skill_gap_agent_node({"run_id": "x", "student_profile": {"skills": []}, "target_roles": []})
+    assert "skill_gap_report" not in result
+    assert "target roles" in result["errors"][0]
 
 
-def test_coding_analytics_agent_node():
-    """Test the coding analytics agent node with mock state (no LLM)."""
+def test_coding_analytics_agent_node_reports_unavailable_sources():
+    """Without consented data the agent reports per-source status and no statistics."""
     from app.agents.coding_analytics_agent import coding_analytics_agent_node
+    from app.connectors.hub import registered_hub
+    from tests.fakes import FakeHub
 
-    state = {
-        "student_id": "test-student-001",
-        "consent_validated": True,
-    }
-
-    result = coding_analytics_agent_node(state)
-
-    assert "coding_analytics" in result, "Missing coding_analytics"
+    with registered_hub("unit-ca", FakeHub()):
+        result = coding_analytics_agent_node({"run_id": "unit-ca", "student_id": "s1", "consent_validated": True})
     analytics = result["coding_analytics"]
-    assert "summary" in analytics, "Missing summary"
-    assert "topic_analysis" in analytics, "Missing topic_analysis"
-    assert analytics["summary"]["total_solved"] > 0, "No problems solved"
-
-    print(f"[PASS] Coding analytics agent - Solved: {analytics['summary']['total_solved']}, "
-          f"Trend: {analytics['summary']['activity_trend']}")
+    assert analytics["status"] == "unavailable"
+    assert "total_solved" not in analytics["summary"]
+    assert {s["source"]: s["status"] for s in analytics["sources"]} == {"leetcode": "not_configured", "github": "not_configured"}
 
 
 def test_job_matching_agent_node():
-    """Test the job matching agent node with mock state (no LLM)."""
+    """Job matching scores listings provided by the job connector."""
     from app.agents.job_matching_agent import job_matching_agent_node
+    from app.connectors.hub import registered_hub
+    from tests.fakes import FakeHub, job
 
     state = {
+        "run_id": "unit-jm",
+        "target_roles": ["software_engineer"],
         "student_profile": {
-            "skills": [
-                {"name": "python", "proficiency": "advanced"},
-                {"name": "javascript", "proficiency": "intermediate"},
-                {"name": "react.js", "proficiency": "intermediate"},
-                {"name": "sql", "proficiency": "intermediate"},
-                {"name": "git", "proficiency": "intermediate"},
-            ],
-            "projects": [
-                {"title": "Web App", "technologies": ["Python", "React.js", "SQL"]},
-            ],
+            "skills": [{"name": "python", "proficiency": "advanced"}, {"name": "sql", "proficiency": "intermediate"}],
+            "projects": [{"title": "Web App", "technologies": ["Python", "SQL"]}],
             "education": {"gpa": 8.0},
         },
-        "skill_gap_report": {"overall_coverage": 70.0},
-        "coding_analytics": {
-            "summary": {
-                "coding_percentile": 72.3,
-                "difficulty_score": 55.0,
-                "activity_trend": "improving",
-            }
-        },
+        "skill_gap_report": {"overall_coverage": 70.0, "gaps": [], "strengths": []},
+        "coding_analytics": {"summary": {"data_available": False}},
         "consent_validated": True,
     }
-
-    result = job_matching_agent_node(state)
-
-    assert "matching_result" in result, "Missing matching_result"
+    with registered_hub("unit-jm", FakeHub(jobs=[job(), job("job-2", "Contoso", "Data Analyst", "analytics", ("SQL", "Excel"))])):
+        result = job_matching_agent_node(state)
     matching = result["matching_result"]
-    assert "matches" in matching, "Missing matches"
-    assert len(matching["matches"]) > 0, "No matches produced"
-
-    top = matching["matches"][0]
-    print(f"[PASS] Job matching agent - Top match: {top['company_name']} "
-          f"({top['match_percentage']}%, confidence={top['confidence']})")
+    assert len(matching["matches"]) == 2
+    assert matching["matches"][0]["company_name"] == "Northwind"   # target-role match ranks first
+    assert matching["matches"][0]["target_role_match"] == "Software Engineer"
+    assert "coding_performance" in matching["matches"][0]["excluded_components"]
+    assert matching["applications_submitted"] == []
 
 
 def test_validation_with_failing_state():
@@ -435,7 +424,7 @@ if __name__ == "__main__":
         test_job_matching_deterministic,
         test_graph_compilation,
         test_skill_gap_agent_node,
-        test_coding_analytics_agent_node,
+        test_coding_analytics_agent_node_reports_unavailable_sources,
         test_job_matching_agent_node,
         test_validation_checks,
         test_validation_with_failing_state,

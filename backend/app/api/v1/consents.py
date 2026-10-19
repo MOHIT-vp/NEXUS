@@ -4,11 +4,11 @@ Lab 12: Consent Management API
 Students grant and revoke explicit per-type consent.
 Consent is a hard prerequisite for the pipeline (enforced by consent_validation node).
 
-Consent types:
-- resume_processing    : analyse resume content
-- coding_data          : fetch and use coding platform data
-- company_sharing      : share profile with matched companies
-- data_retention       : retain processed data for longitudinal improvement
+Consent types (one per data source):
+- resume_processing    : analyse the uploaded resume (required)
+- github               : read the public GitHub profile for the handle given
+- leetcode             : read the public LeetCode profile for the handle given
+- academic_records     : use the CGPA entered for eligibility checks
 """
 import uuid
 from datetime import datetime, timezone
@@ -26,12 +26,9 @@ from app.models.user import Consent
 
 router = APIRouter(prefix="/consents", tags=["Consents"])
 
-VALID_CONSENT_TYPES = {
-    "resume_processing",
-    "coding_data",
-    "company_sharing",
-    "data_retention",
-}
+from app.services.consent import CONSENT_SOURCES
+
+VALID_CONSENT_TYPES = set(CONSENT_SOURCES)
 
 
 # ---------------------------------------------------------------------------

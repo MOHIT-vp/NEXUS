@@ -4,7 +4,19 @@ Shared fixtures for the full acceptance test suite (Lab 11).
 All fixtures are deterministic — no LLM calls, no external I/O.
 Import path: tests/conftest.py  (auto-loaded by pytest for all test files)
 """
+import os
+import tempfile
+
+# No LLM or network calls during tests; uploads go to a temporary folder
+os.environ["LLM_API_KEY"] = ""
+os.environ.setdefault("UPLOAD_DIR", tempfile.mkdtemp(prefix="placement-uploads-"))
+# Run checkpoints go to a throwaway file; similarity uses the no-download embeddings unless a test opts in
+os.environ["CHECKPOINT_DB_PATH"] = os.path.join(tempfile.mkdtemp(prefix="placement-ckpt-"), "checkpoints.sqlite")
+os.environ.setdefault("EMBEDDING_BACKEND", "hashed")
+
 import pytest
+
+from tests.support import *  # noqa: E402,F401,F403  (database, client and fake-connector fixtures)
 
 
 # ---------------------------------------------------------------------------

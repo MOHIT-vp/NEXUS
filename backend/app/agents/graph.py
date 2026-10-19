@@ -10,13 +10,19 @@ into one explicit pipeline with:
 - Budget enforcement at every node transition
 
 Architecture:
-    START → plan_workflow → lock_plan → consent_validation → resume_agent
-        → [skill_gap_agent ‖ coding_analytics_agent]  (parallel fan-out, Lab 8)
-        → join_parallel → job_matching_agent → interview_agent → validation_agent
-            ├── PASS → assemble_draft → END
-            ├── FAIL + retries left → diagnose_and_regenerate
-            │       └── → (failing agent only) → validation_agent  (Lab 10)
-            └── FAIL + no retries → assemble_draft (with warnings) → END
+    START → plan_workflow → lock_plan → consent_validation
+        ├── consents missing → validation_agent (fails CONSENT_SATISFIED, escalates)
+        └── resume_agent → [skill_gap_agent ‖ coding_analytics_agent]  (parallel fan-out, Lab 8)
+            → join_parallel (merges consented GitHub skill evidence)
+            → domain_specialists (Lab 13) → job_matching_agent → interview_agent → validation_agent
+                ├── PASS → assemble_draft → END
+                ├── FAIL + healable + retries left → diagnose_and_regenerate
+                │       └── → (failing agent only) → ... → validation_agent  (Lab 10)
+                └── FAIL otherwise → assemble_draft (marked failed) → END
+
+All data access goes through the connector hub registered for the run (Lab 5).
+The assembled draft is written to state["draft"] and is what the API persists,
+re-validates on edit, and versions on approval (Lab 15).
 """
 from typing import Dict, Any
 from datetime import datetime, timezone
@@ -33,6 +39,7 @@ from app.agents.coding_analytics_agent import coding_analytics_agent_node
 from app.agents.job_matching_agent import job_matching_agent_node
 from app.agents.interview_agent import interview_agent_node
 from app.agents.validation_agent import validation_agent_node
+from app.agents.domain_specialist_agent import domain_specialist_node
 from app.agents.self_healing import (
     diagnose_and_regenerate as _diagnose_logic,
     regeneration_route,
@@ -49,78 +56,80 @@ logger = logging.getLogger(__name__)
 
 def consent_validation_node(state: PlacementState) -> Dict[str, Any]:
     """
-    Node: Validate that all required consents are in place before processing.
-    For Lab 7, this performs a basic consent check.
-    In production, this queries the Consent table via the StudentConnector.
+    Node: read the student's consent records from the Consent table (via the
+    StudentConnector). Required sources must be
+    `granted`; missing, revoked or invalid consent is never treated as granted.
     """
-    logger.info("[ConsentValidation] Checking consents...")
+    from app.connectors.hub import HubUnavailableError, get_hub
+    from app.services.consent import missing_required
 
-    student_id = state.get("student_id", "unknown")
+    student_id = state.get("student_id", "")
+    try:
+        hub = get_hub(state)
+        snapshot = hub.consent_status(student_id)
+    except HubUnavailableError as exc:
+        return {"consent_validated": False, "consent_status": None, "current_step": "consent_validation",
+                "errors": [f"ConsentValidation: {exc}"]}
+    except Exception as exc:
+        return {"consent_validated": False, "consent_status": None, "current_step": "consent_validation",
+                "errors": [f"ConsentValidation: could not read consent records ({exc.__class__.__name__})"]}
 
-    # For Lab 7: consent is assumed to be validated (mock)
-    # Production: would check data_sharing, resume_processing, coding_platform consents
-    consent_status = {
-        "data_sharing": True,
-        "resume_processing": True,
-        "coding_platform": True,
-        "interview_data": True,
-    }
-
+    missing = missing_required(snapshot)
+    validated = not missing
     audit = AuditEvent(
-        action="consent_validated",
+        action="consent_validated" if validated else "consent_blocked",
         agent="ConsentValidation",
         timestamp=datetime.now(timezone.utc).isoformat(),
-        details={"consents": consent_status, "student_id": student_id}
+        details={"student_id": student_id, "status": {k: v["status"] for k, v in snapshot.items()},
+                 "missing_required": missing},
     )
-
-    logger.info(f"[ConsentValidation] All consents validated for student {student_id[:8]}...")
-
-    return {
-        "consent_validated": True,
+    update: Dict[str, Any] = {
+        "consent_validated": validated,
+        "consent_status": snapshot,
         "current_step": "consent_validation",
         "audit_events": [audit],
     }
+    if not validated:
+        update["errors"] = [f"ConsentValidation: required consent not granted — {missing}"]
+    return update
+
+
+def consent_router(state: PlacementState) -> str:
+    return "granted" if state.get("consent_validated") else "blocked"
 
 
 def join_parallel_node(state: PlacementState) -> Dict[str, Any]:
     """
-    Node: Join/merge point after parallel agents complete.
-    In Lab 7, this is sequential. Lab 8 will add true parallel fan-out.
-    This node verifies both skill_gap and coding_analytics are present,
-    then signals readiness for the Job Matching Agent.
+    Node: join after the parallel Skill-Gap and Coding-Analytics branches.
+    Skills corroborated by the student's consented GitHub repositories are merged
+    into the gap report here, because the two branches run concurrently.
     """
-    logger.info("[JoinParallel] Merging parallel agent results...")
+    from app.agents.skill_gap_agent import apply_coding_evidence
 
     has_skill_gap = state.get("skill_gap_report") is not None
     has_coding = state.get("coding_analytics") is not None
-
     merge_status = {
         "skill_gap_report": "present" if has_skill_gap else "missing",
         "coding_analytics": "present" if has_coding else "missing",
     }
-
     errors = []
     if not has_skill_gap:
         errors.append("JoinParallel: skill_gap_report is missing")
     if not has_coding:
         errors.append("JoinParallel: coding_analytics is missing")
 
-    audit = AuditEvent(
-        action="parallel_results_merged",
-        agent="JoinParallel",
-        timestamp=datetime.now(timezone.utc).isoformat(),
-        details=merge_status,
-    )
+    result: Dict[str, Any] = {"current_step": "join_parallel"}
+    updated = apply_coding_evidence(state) if (has_skill_gap and has_coding) else None
+    if updated is not None:
+        result["skill_gap_report"] = updated
+        merge_status["github_skill_evidence"] = "merged"
 
-    logger.info(f"[JoinParallel] Merge status: {merge_status}")
-
-    result: Dict[str, Any] = {
-        "current_step": "join_parallel",
-        "audit_events": [audit],
-    }
+    result["audit_events"] = [AuditEvent(
+        action="parallel_results_merged", agent="JoinParallel",
+        timestamp=datetime.now(timezone.utc).isoformat(), details=merge_status,
+    )]
     if errors:
         result["errors"] = errors
-
     return result
 
 
@@ -132,102 +141,67 @@ def diagnose_and_regenerate_node(state: PlacementState) -> Dict[str, Any]:
     return _diagnose_logic(state)
 
 
+DRAFT_SECTIONS = (
+    "student_profile", "skill_gap_report", "coding_analytics", "specialist_analysis",
+    "matching_result", "interview_result", "roadmap", "retrieval", "role_requirements", "student_context",
+)
+
+
 def assemble_draft_node(state: PlacementState) -> Dict[str, Any]:
     """
-    Node: Assemble the final readiness plan draft from all agent outputs.
-    This combines everything into the publishable document structure.
+    Node: assemble the per-student readiness plan and shortlist draft.
+    The draft is state-shaped (same section keys) so it can be re-validated after
+    officer edits, and it is the object persisted, reviewed and versioned.
     """
-    logger.info("[AssembleDraft] Assembling final readiness plan draft...")
-
     validation_passed = state.get("validation_passed", False)
-    student_profile = state.get("student_profile", {})
-    skill_gap_report = state.get("skill_gap_report", {})
-    coding_analytics = state.get("coding_analytics", {})
-    matching_result = state.get("matching_result", {})
-    interview_result = state.get("interview_result", {})
-    roadmap = state.get("roadmap", {})
-    evidence_records = state.get("evidence_records", [])
-    validation_report = state.get("validation_report", {})
-
-    # Build the complete draft
-    draft = {
+    validation_report = state.get("validation_report") or {}
+    plan = state.get("plan")
+    draft: Dict[str, Any] = {
         "metadata": {
             "student_id": state.get("student_id"),
             "run_id": state.get("run_id"),
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "validation_status": "passed" if validation_passed else "passed_with_warnings",
+            "validation_status": "passed" if validation_passed else "failed",
+            "validation_passed": validation_passed,
             "version": "draft",
+            "extraction_method": (state.get("student_profile") or {}).get("extraction_method"),
         },
-        "student_profile": {
-            "summary": student_profile.get("summary", ""),
-            "skills_count": len(student_profile.get("skills", [])),
-            "projects_count": len(student_profile.get("projects", [])),
-            "education": student_profile.get("education"),
-        },
-        "skill_assessment": {
-            "overall_coverage": skill_gap_report.get("overall_coverage", 0),
-            "assessment": skill_gap_report.get("overall_assessment", "unknown"),
-            "strengths_count": len(skill_gap_report.get("strengths", [])),
-            "gaps_count": len(skill_gap_report.get("gaps", [])),
-        },
-        "coding_performance": {
-            "total_solved": coding_analytics.get("summary", {}).get("total_solved", 0),
-            "percentile": coding_analytics.get("summary", {}).get("coding_percentile", 0),
-            "trend": coding_analytics.get("summary", {}).get("activity_trend", "unknown"),
-        },
-        "job_matches": {
-            "total_evaluated": matching_result.get("total_jobs_evaluated", 0),
-            "eligible_count": matching_result.get("eligible_count", 0),
-            "top_match_score": (
-                matching_result.get("matches", [{}])[0].get("match_percentage", 0)
-                if matching_result.get("matches") else 0
-            ),
-            "readiness_score": matching_result.get("readiness_score", {}),
-        },
-        "interview_preparation": {
-            "questions_generated": interview_result.get("total_questions", 0),
-            "readiness_percentage": interview_result.get("readiness_assessment", {}).get("percentage", 0),
-        },
-        "learning_roadmap": {
-            "total_items": roadmap.get("total_items", 0),
-            "total_hours": roadmap.get("total_estimated_hours", 0),
-        },
-        "validation": {
-            "passed": validation_passed,
-            "checks_passed": validation_report.get("passed_checks", 0),
-            "total_checks": validation_report.get("total_checks", 0),
-            "warnings": validation_report.get("warning_failures", 0),
-        },
-        "evidence_count": len(evidence_records),
+        "student_id": state.get("student_id"),
+        "run_id": state.get("run_id"),
+        "request": state.get("request_context"),
+        "target_roles": state.get("target_roles") or [],
+        "plan": plan.model_dump() if hasattr(plan, "model_dump") else plan,
+        "consent_validated": state.get("consent_validated", False),
+        "consent_status": state.get("consent_status"),
+        "resume_data": {k: v for k, v in (state.get("resume_data") or {}).items()
+                        if k in ("resume_id", "file_name", "is_duplicate", "similarity_score", "matched_student_id")},
+        "evidence_records": state.get("evidence_records", []),
+        "validation_report": validation_report,
+        "officer_notes": [],
+        "errors": state.get("errors", []),
     }
-
-    # Add warning flags if validation didn't fully pass
+    for key in DRAFT_SECTIONS:
+        draft[key] = state.get(key)
+    draft["summary"] = {
+        "readiness_percentage": ((state.get("matching_result") or {}).get("readiness_score") or {}).get("percentage"),
+        "skill_coverage": (state.get("skill_gap_report") or {}).get("overall_coverage"),
+        "target_roles": (state.get("skill_gap_report") or {}).get("target_roles", state.get("target_roles") or []),
+        "top_matches": [
+            {k: m.get(k) for k in ("company_name", "role_title", "match_percentage", "confidence", "is_eligible")}
+            for m in ((state.get("matching_result") or {}).get("matches") or [])[:3]
+        ],
+        "evidence_count": len(state.get("evidence_records", [])),
+        "checks_passed": validation_report.get("passed_checks", 0),
+        "total_checks": validation_report.get("total_checks", 0),
+    }
     if not validation_passed:
-        draft["metadata"]["warning"] = (
-            "This draft contains warnings from validation. "
-            "Review the validation report before approval."
-        )
         draft["metadata"]["failing_checks"] = state.get("failing_checks", [])
 
     audit = AuditEvent(
-        action="draft_assembled",
-        agent="AssembleDraft",
-        timestamp=datetime.now(timezone.utc).isoformat(),
-        details={
-            "validation_passed": validation_passed,
-            "sections_included": list(draft.keys()),
-        }
+        action="draft_assembled", agent="AssembleDraft", timestamp=datetime.now(timezone.utc).isoformat(),
+        details={"validation_passed": validation_passed, "sections": [k for k in DRAFT_SECTIONS if draft.get(k)]},
     )
-
-    logger.info(
-        f"[AssembleDraft] Draft assembled — Validation: {'✅' if validation_passed else '⚠️'}, "
-        f"Evidence: {len(evidence_records)} records"
-    )
-
-    return {
-        "current_step": "assemble_draft",
-        "audit_events": [audit],
-    }
+    return {"draft": draft, "current_step": "assemble_draft", "audit_events": [audit]}
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +272,7 @@ def build_placement_graph():
     workflow.add_node("skill_gap_agent", skill_gap_agent_node)
     workflow.add_node("coding_analytics_agent", coding_analytics_agent_node)
     workflow.add_node("join_parallel", join_parallel_node)
+    workflow.add_node("domain_specialists", domain_specialist_node)
 
     # Phase 4: Downstream agents
     workflow.add_node("job_matching_agent", job_matching_agent_node)
@@ -330,8 +305,12 @@ def build_placement_graph():
     # Lock plan → consent validation
     workflow.add_edge("lock_plan", "consent_validation")
 
-    # Consent → Resume
-    workflow.add_edge("consent_validation", "resume_agent")
+    # Consent → Resume (or straight to validation when required consent is missing)
+    workflow.add_conditional_edges(
+        "consent_validation",
+        consent_router,
+        {"granted": "resume_agent", "blocked": "validation_agent"},
+    )
 
     # Phase 3: Parallel agents (true parallel fan-out for Lab 8)
     # Resume → Skill Gap AND Coding Analytics
@@ -342,8 +321,9 @@ def build_placement_graph():
     workflow.add_edge("skill_gap_agent", "join_parallel")
     workflow.add_edge("coding_analytics_agent", "join_parallel")
 
-    # Join → Job Matching
-    workflow.add_edge("join_parallel", "job_matching_agent")
+    # Join → Domain specialists (Lab 13) → Job Matching
+    workflow.add_edge("join_parallel", "domain_specialists")
+    workflow.add_edge("domain_specialists", "job_matching_agent")
 
     # Job Matching → Interview
     workflow.add_edge("job_matching_agent", "interview_agent")
@@ -382,11 +362,29 @@ def build_placement_graph():
     # =====================================================================
     # COMPILE WITH CHECKPOINTING
     # =====================================================================
-    memory = MemorySaver()
-    compiled = workflow.compile(checkpointer=memory)
+    compiled = workflow.compile(checkpointer=make_checkpointer())
 
     logger.info("[Graph] Full placement readiness graph compiled successfully.")
     return compiled
+
+
+def make_checkpointer():
+    """
+    Lab 6: progress is saved after every node. With SQLite (default) the saved
+    progress survives a crash or restart, so the run continues from the last
+    completed step instead of starting over.
+    """
+    from app.config import settings
+    if settings.CHECKPOINT_BACKEND.lower() == "memory":
+        return MemorySaver()
+    import os
+    import sqlite3
+    from langgraph.checkpoint.sqlite import SqliteSaver
+    path = settings.CHECKPOINT_DB_PATH
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    saver = SqliteSaver(sqlite3.connect(path, check_same_thread=False))
+    saver.setup()
+    return saver
 
 
 # Export the compiled graph

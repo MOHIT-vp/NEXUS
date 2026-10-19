@@ -12,6 +12,7 @@ venv/
 # Environment and local secrets
 .env
 .env.*
+!.env.example
 # Local application data
 uploads/
 *.sqlite3
@@ -38,3 +39,8 @@ Thumbs.db
 dist/
 build/
 *.log
+# LangGraph run checkpoints (local runtime data)
+backend/data/
+
+# Local agent/editor configuration
+.claude/

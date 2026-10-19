@@ -1,58 +1,26 @@
 """
-Job Matching Agent (A4) — Deterministic scoring engine + LLM match reasoning.
+Job Matching Agent (A4) — placement score + ranked company/role matches.
 
-Architecture Contract:
-- Input: student_profile, skill_gap_report, coding_analytics, available_roles, scoring_config
-- Output: readiness_score (with component breakdown), ranked matches with confidence + reasoning
-- Scoring: 100% DETERMINISTIC application code — NOT LLM
-- LLM Usage: Match reasoning and explanation ONLY
-- Constraints: Never overstate certainty, flag low-confidence (<0.6), provide evidence for each match
-
-Readiness Score Formula:
-    Total = Σ(component_score × component_weight)
-    Components:
-    - skill_coverage     (weight: 0.40, max: 40)
-    - coding_performance (weight: 0.25, max: 25)
-    - project_relevance  (weight: 0.15, max: 15)
-    - interview_readiness(weight: 0.15, max: 15)  — placeholder until Interview Agent runs
-    - eligibility        (weight: 0.05, max: 5)    — binary PASS/FAIL
+Architecture contract:
+- Input: evidenced profile, skill-gap report, coding analytics, specialist weights
+- Data: JobConnector via the hub — active listings from the companies/jobs tables
+- Scoring: 100% deterministic; the LLM may only add a labelled narrative
+- Guardrails: show confidence and reasoning; do not overstate fit; route
+  low-confidence and stale/unverified matches to human review; enforce
+  eligibility (CGPA / backlogs / experience); never submit applications
 """
-from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timezone
-from decimal import Decimal
+from typing import Any, Dict, List, Optional, Tuple
 import logging
 
-from pydantic import BaseModel, Field
-
-from app.config import settings
-from app.agents.state import PlacementState, AuditEvent
+from app.agents.llm import get_chat_model
+from app.agents.state import AuditEvent, PlacementState
+from app.connectors.hub import HubUnavailableError, get_hub
+from app.core.roles import resolve_targets
+from app.core.skills import canonical, canonical_set
+from app.schemas.evidence import EvidenceRecord
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Pydantic schemas
-# ---------------------------------------------------------------------------
-
-class MatchReasoning(BaseModel):
-    """LLM-generated reasoning for a single job match."""
-    job_title: str
-    company_name: str
-    reasoning: str = Field(description="Specific, evidence-based reasoning for this match score")
-    fit_highlights: List[str] = Field(description="Top 3 reasons this role is a good fit")
-    concern_areas: List[str] = Field(description="Areas where the student may struggle in this role")
-
-
-class MatchReasoningBatch(BaseModel):
-    """LLM-generated reasonings for all matches."""
-    overall_narrative: str = Field(description="1-2 sentence summary of the student's job market position")
-    match_reasonings: List[MatchReasoning]
-    career_advice: str = Field(description="Brief, actionable career advice based on the matching results")
-
-
-# ---------------------------------------------------------------------------
-# Default scoring configuration
-# ---------------------------------------------------------------------------
 
 DEFAULT_SCORING_CONFIG = {
     "skill_coverage": {"weight": 0.40, "max_points": 40},
@@ -64,86 +32,23 @@ DEFAULT_SCORING_CONFIG = {
 
 LOW_CONFIDENCE_THRESHOLD = 0.6
 
+APPLICATION_POLICY = ("The portal never submits applications. Students apply themselves through the "
+                      "company's application link after the Placement Cell releases the plan.")
 
-# ---------------------------------------------------------------------------
-# Mock job data (Lab 7)
-# ---------------------------------------------------------------------------
 
-def _get_mock_available_jobs() -> List[Dict[str, Any]]:
-    """
-    Returns available job listings from company_service (including newly listed drives).
-    Falls back to baseline if company_service is not initialized.
-    """
-    try:
-        from app.services.company_service import company_service
-        drives = company_service.get_all_jobs_for_matching()
-        if drives:
-            return drives
-    except Exception:
-        pass
-
-    return [
-        {
-            "job_id": "job-001",
-            "company_name": "TechCorp Solutions",
-            "role_title": "Software Engineer",
-            "role_family": "software_engineering",
-            "min_cgpa": 7.0,
-            "min_experience": 0,
-            "package_lpa": 12.0,
-            "required_skills": ["Python", "JavaScript", "React.js", "SQL", "Git"],
-            "preferred_skills": ["Docker", "AWS", "System Design"],
-            "description": "Full-stack development role focusing on web applications.",
-        },
-        {
-            "job_id": "job-002",
-            "company_name": "DataDriven Inc.",
-            "role_title": "Data Engineer",
-            "role_family": "data_engineering",
-            "min_cgpa": 7.5,
-            "min_experience": 0,
-            "package_lpa": 15.0,
-            "required_skills": ["Python", "SQL", "Data Structures", "Algorithms"],
-            "preferred_skills": ["Machine Learning", "Apache Spark", "AWS"],
-            "description": "Building data pipelines and analytics infrastructure.",
-        },
-        {
-            "job_id": "job-003",
-            "company_name": "InnovateTech",
-            "role_title": "Backend Developer",
-            "role_family": "software_engineering",
-            "min_cgpa": 6.5,
-            "min_experience": 0,
-            "package_lpa": 10.0,
-            "required_skills": ["Python", "Node.js", "SQL", "Git"],
-            "preferred_skills": ["Docker", "Kubernetes", "Redis"],
-            "description": "API development and microservices architecture.",
-        },
-        {
-            "job_id": "job-004",
-            "company_name": "CloudFirst Systems",
-            "role_title": "DevOps Engineer",
-            "role_family": "devops",
-            "min_cgpa": 7.0,
-            "min_experience": 0,
-            "package_lpa": 14.0,
-            "required_skills": ["Docker", "Kubernetes", "AWS", "Linux", "Git"],
-            "preferred_skills": ["Terraform", "Python", "CI/CD"],
-            "description": "Infrastructure automation and deployment pipeline engineering.",
-        },
-        {
-            "job_id": "job-005",
-            "company_name": "FinSecure Analytics",
-            "role_title": "Full Stack Developer",
-            "role_family": "software_engineering",
-            "min_cgpa": 7.0,
-            "min_experience": 0,
-            "package_lpa": 11.0,
-            "required_skills": ["React.js", "Node.js", "JavaScript", "SQL"],
-            "preferred_skills": ["TypeScript", "PostgreSQL", "Redis"],
-            "description": "Building secure fintech web applications.",
-        },
-    ]
+def scoring_config_from_weights(weights: Optional[Dict[str, float]]) -> Dict[str, Dict[str, float]]:
+    """Build the scoring config from Lab 13 specialist weights (falls back to the default)."""
+    if not weights:
+        return {k: dict(v) for k, v in DEFAULT_SCORING_CONFIG.items()}
+    mapping = {
+        "skill_coverage": weights.get("skill_coverage", 0.4),
+        "coding_performance": weights.get("coding_performance", 0.25),
+        "project_relevance": weights.get("project_relevance", 0.15),
+        "interview_readiness": weights.get("interview_performance", 0.15),
+        "eligibility": weights.get("eligibility", 0.05),
+    }
+    total = sum(mapping.values()) or 1.0
+    return {k: {"weight": round(v / total, 4), "max_points": round(v / total * 100, 2)} for k, v in mapping.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -156,75 +61,58 @@ def _compute_skill_coverage_score(
     preferred_skills: List[str],
     max_points: float,
 ) -> Tuple[float, Dict[str, Any]]:
-    """
-    Deterministic skill coverage scoring.
-    Required skills: full weight
-    Preferred skills: 50% weight bonus (on top of required)
-    """
-    if not required_skills:
-        return max_points, {"matched_required": 0, "total_required": 0}
-
-    student_skill_names = {s.get("name", "").lower().strip() for s in student_skills}
-
-    # Required skill matching
-    required_matches = sum(1 for s in required_skills if s.lower() in student_skill_names)
-    required_ratio = required_matches / len(required_skills)
-
-    # Preferred skill bonus (up to 20% extra)
-    preferred_matches = sum(1 for s in preferred_skills if s.lower() in student_skill_names) if preferred_skills else 0
-    preferred_ratio = preferred_matches / len(preferred_skills) if preferred_skills else 0
-
-    # Base score from required + bonus from preferred
-    base_score = required_ratio * max_points * 0.85  # 85% of max from required
-    bonus_score = preferred_ratio * max_points * 0.15  # 15% of max from preferred
-
-    score = round(min(base_score + bonus_score, max_points), 2)
-
-    details = {
-        "matched_required": required_matches,
+    """Required skills give 85% of the points, preferred skills the remaining 15%."""
+    have = canonical_set(student_skills)
+    if not required_skills and not preferred_skills:
+        return 0.0, {"matched_required": 0, "total_required": 0, "required_ratio": 0.0,
+                     "note": "Listing has no skill requirements recorded"}
+    req_matches = sum(1 for s in required_skills if canonical(s) in have)
+    req_ratio = req_matches / len(required_skills) if required_skills else 1.0
+    pref_matches = sum(1 for s in preferred_skills if canonical(s) in have) if preferred_skills else 0
+    pref_ratio = pref_matches / len(preferred_skills) if preferred_skills else 0.0
+    score = round(min(req_ratio * max_points * 0.85 + pref_ratio * max_points * 0.15, max_points), 2)
+    return score, {
+        "matched_required": req_matches,
         "total_required": len(required_skills),
-        "matched_preferred": preferred_matches,
+        "matched_preferred": pref_matches,
         "total_preferred": len(preferred_skills),
-        "required_ratio": round(required_ratio, 2),
+        "required_ratio": round(req_ratio, 2),
     }
 
-    return score, details
+
+def coding_available(coding_analytics: Optional[Dict[str, Any]]) -> bool:
+    if not coding_analytics:
+        return False
+    summary = coding_analytics.get("summary") or {}
+    if "data_available" in summary:
+        return bool(summary["data_available"])
+    return any(k in summary for k in ("coding_percentile", "coding_index", "total_solved"))
 
 
 def _compute_coding_performance_score(
     coding_analytics: Optional[Dict[str, Any]],
     max_points: float,
 ) -> Tuple[float, Dict[str, Any]]:
-    """
-    Deterministic coding performance scoring.
-    Uses the pre-computed coding percentile from the Coding Analytics Agent.
-    """
-    if not coding_analytics:
-        return 0.0, {"reason": "No coding analytics available"}
-
+    """Uses the coding index (LeetCode) or GitHub activity; 0 with a reason when unavailable."""
+    if not coding_available(coding_analytics):
+        return 0.0, {"reason": "No consented coding-platform data available", "available": False}
     summary = coding_analytics.get("summary", {})
-    percentile = summary.get("coding_percentile", 0)
-    difficulty_score = summary.get("difficulty_score", 0)
+    index = summary.get("coding_index", summary.get("coding_percentile"))
     trend = summary.get("activity_trend", "stable")
-
-    # Base: percentile maps directly to points (percentile/100 * max)
-    base = (percentile / 100) * max_points * 0.7
-
-    # Difficulty bonus: rewarding harder problems (up to 20% of max)
-    difficulty_bonus = (difficulty_score / 100) * max_points * 0.2
-
-    # Trend bonus: improving = +10%, stable = 0, declining = -5%
-    trend_multipliers = {"improving": 0.10, "stable": 0.0, "declining": -0.05}
-    trend_bonus = max_points * trend_multipliers.get(trend, 0)
-
-    score = round(min(max(base + difficulty_bonus + trend_bonus, 0), max_points), 2)
-
-    return score, {
-        "percentile": percentile,
-        "difficulty_score": difficulty_score,
-        "trend": trend,
-        "base_points": round(base, 2),
-    }
+    trend_bonus = max_points * {"improving": 0.10, "stable": 0.0, "declining": -0.05}.get(trend, 0)
+    if index is not None:
+        difficulty = summary.get("difficulty_score", 0) or 0
+        base = (index / 100) * max_points * 0.7
+        diff_bonus = (difficulty / 100) * max_points * 0.2
+        score = round(min(max(base + diff_bonus + trend_bonus, 0), max_points), 2)
+        return score, {"basis": "leetcode", "coding_index": index, "difficulty_score": difficulty,
+                       "trend": trend, "available": True}
+    gh = summary.get("github") or {}
+    activity = min(gh.get("recently_active_repos", 0) / 5, 1.0)
+    breadth = min(gh.get("original_repos", 0) / 10, 1.0)
+    score = round(min(max((activity * 0.5 + breadth * 0.5) * max_points * 0.8 + trend_bonus, 0), max_points), 2)
+    return score, {"basis": "github", "recently_active_repos": gh.get("recently_active_repos", 0),
+                   "original_repos": gh.get("original_repos", 0), "trend": trend, "available": True}
 
 
 def _compute_project_relevance_score(
@@ -232,41 +120,25 @@ def _compute_project_relevance_score(
     job: Dict[str, Any],
     max_points: float,
 ) -> Tuple[float, Dict[str, Any]]:
-    """
-    Deterministic project relevance scoring.
-    Matches student project technologies against job requirements.
-    """
     projects = student_profile.get("projects", [])
     if not projects:
         return 0.0, {"reason": "No projects found"}
-
-    required = {s.lower() for s in job.get("required_skills", [])}
-    preferred = {s.lower() for s in job.get("preferred_skills", [])}
-    all_relevant = required | preferred
-
+    relevant = {canonical(s) for s in job.get("required_skills", []) + job.get("preferred_skills", [])}
+    if not relevant:
+        return 0.0, {"reason": "Listing has no skill requirements recorded"}
     matching_projects = 0
-    total_tech_matches = 0
-
-    for project in projects:
-        techs = {t.lower() for t in project.get("technologies", [])}
-        overlap = techs & all_relevant
+    total_matches = 0
+    for p in projects:
+        overlap = canonical_set(p.get("technologies", [])) & relevant
         if overlap:
             matching_projects += 1
-            total_tech_matches += len(overlap)
-
-    if not projects:
-        ratio = 0
-    else:
-        ratio = matching_projects / len(projects)
-
-    # Score: combination of project match ratio and tech depth
-    tech_depth = min(total_tech_matches / max(len(all_relevant), 1), 1.0)
-    score = round(((ratio * 0.6) + (tech_depth * 0.4)) * max_points, 2)
-
-    return score, {
+            total_matches += len(overlap)
+    ratio = matching_projects / len(projects)
+    depth = min(total_matches / max(len(relevant), 1), 1.0)
+    return round((ratio * 0.6 + depth * 0.4) * max_points, 2), {
         "matching_projects": matching_projects,
         "total_projects": len(projects),
-        "tech_overlap_count": total_tech_matches,
+        "tech_overlap_count": total_matches,
     }
 
 
@@ -274,78 +146,75 @@ def _check_eligibility(
     student_profile: Dict[str, Any],
     job: Dict[str, Any],
     max_points: float,
+    academic: Optional[Dict[str, Any]] = None,
 ) -> Tuple[float, bool, Dict[str, Any]]:
     """
-    Deterministic eligibility check. Binary PASS/FAIL.
-    Checks CGPA minimum and experience requirements.
+    Binary eligibility. CGPA comes from consented academic records first, then the
+    resume. If a listing has a CGPA cutoff and no CGPA is available, eligibility
+    cannot be verified and the match is treated as not eligible.
     """
-    # Extract student GPA from education data
-    education = student_profile.get("education", {})
-    student_gpa = education.get("gpa") if education else None
+    academic = academic or {}
+    education = student_profile.get("education") or {}
+    gpa = academic.get("cgpa") if academic.get("cgpa") is not None else education.get("gpa")
+    gpa_source = "academic_records" if academic.get("cgpa") is not None else ("resume" if gpa is not None else None)
+    backlogs = academic.get("active_backlogs")
+    min_cgpa = float(job.get("min_cgpa") or 0)
+    max_backlogs = job.get("max_backlogs")
+    min_exp = job.get("min_experience") or 0
 
-    min_cgpa = job.get("min_cgpa", 0)
-    min_experience = job.get("min_experience", 0)
+    reasons, eligible, verified = [], True, True
+    if min_cgpa > 0:
+        if gpa is None:
+            eligible, verified = False, False
+            reasons.append(f"CGPA cutoff {min_cgpa} cannot be verified: no CGPA in consented academic records or resume")
+        elif float(gpa) < min_cgpa:
+            eligible = False
+            reasons.append(f"CGPA {gpa} below minimum {min_cgpa}")
+    if max_backlogs is not None and backlogs is not None and backlogs > max_backlogs:
+        eligible = False
+        reasons.append(f"{backlogs} active backlog(s) exceed the allowed {max_backlogs}")
+    years = student_profile.get("years_experience", 0) or 0
+    if min_exp and years < min_exp:
+        eligible = False
+        reasons.append(f"Experience {years}y below minimum {min_exp}y")
 
-    reasons = []
-    is_eligible = True
-
-    # GPA check (only if both are available)
-    if min_cgpa and student_gpa is not None:
-        if float(student_gpa) < float(min_cgpa):
-            is_eligible = False
-            reasons.append(f"CGPA {student_gpa} below minimum {min_cgpa}")
-
-    # Experience check
-    years = student_profile.get("years_experience", 0)
-    if min_experience and years < min_experience:
-        is_eligible = False
-        reasons.append(f"Experience {years}y below minimum {min_experience}y")
-
-    score = max_points if is_eligible else 0.0
-
-    return score, is_eligible, {
-        "is_eligible": is_eligible,
-        "student_gpa": student_gpa,
+    return (max_points if eligible else 0.0), eligible, {
+        "is_eligible": eligible,
+        "verified": verified,
+        "student_gpa": gpa,
+        "gpa_source": gpa_source,
         "required_gpa": min_cgpa,
+        "active_backlogs": backlogs,
+        "max_backlogs": max_backlogs,
         "fail_reasons": reasons,
     }
 
 
-def _compute_match_confidence(
-    skill_score: float,
-    coding_score: float,
-    eligibility: bool,
-    skill_details: Dict,
-    config: Dict,
-) -> float:
-    """
-    Compute confidence level for a match (0.0 - 1.0).
-    Low confidence when:
-    - Few data points available
-    - Required skill coverage < 50%
-    - Not eligible
-    """
+def _compute_match_confidence(skill_score, coding_score, eligibility, skill_details, config,
+                              coding_ok: bool = True, stale: bool = False) -> float:
+    """0-1 confidence; low when ineligible, few data points, low required coverage or stale listing."""
     if not eligibility:
-        return 0.1  # Very low confidence for ineligible
+        return 0.1
+    factors = [skill_details.get("required_ratio", 0), 1.0 if coding_ok else 0.3]
+    skill_max = config["skill_coverage"]["max_points"]
+    coding_max = config["coding_performance"]["max_points"] if coding_ok else 0
+    denom = (skill_max + coding_max) * 0.65 or 1
+    factors.append(min((skill_score + (coding_score if coding_ok else 0)) / denom, 1.0))
+    conf = sum(factors) / len(factors)
+    if stale:
+        conf *= 0.8
+    return round(min(max(conf, 0.0), 1.0), 2)
 
-    factors = []
 
-    # Required skill coverage
-    req_ratio = skill_details.get("required_ratio", 0)
-    factors.append(req_ratio)
-
-    # Coding data availability
-    coding_available = 1.0 if coding_score > 0 else 0.3
-    factors.append(coding_available)
-
-    # Overall score proportion
-    total_max = sum(c["max_points"] for c in config.values())
-    total_score = skill_score + coding_score
-    score_ratio = min(total_score / (total_max * 0.65), 1.0)  # Relative to 65% threshold
-    factors.append(score_ratio)
-
-    confidence = sum(factors) / len(factors)
-    return round(min(max(confidence, 0.0), 1.0), 2)
+def _target_match(job: Dict[str, Any], targets: List[Dict[str, Any]]) -> Optional[str]:
+    title = (job.get("role_title") or "").lower()
+    family = (job.get("role_family") or "").lower()
+    for t in targets:
+        if family and family in [f.lower() for f in t.get("job_families", [])]:
+            return t["title"]
+        if t["title"].lower() in title or title in t["title"].lower():
+            return t["title"]
+    return None
 
 
 def _score_single_job(
@@ -353,70 +222,53 @@ def _score_single_job(
     coding_analytics: Optional[Dict[str, Any]],
     job: Dict[str, Any],
     config: Dict[str, Any],
+    academic: Optional[Dict[str, Any]] = None,
+    targets: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """Score a single job match. Returns the complete score breakdown."""
-
-    # 1. Skill Coverage
+    coding_ok = coding_available(coding_analytics)
     skill_score, skill_details = _compute_skill_coverage_score(
-        student_profile.get("skills", []),
-        job.get("required_skills", []),
-        job.get("preferred_skills", []),
-        config["skill_coverage"]["max_points"],
-    )
+        student_profile.get("skills", []), job.get("required_skills", []), job.get("preferred_skills", []),
+        config["skill_coverage"]["max_points"])
+    coding_score, coding_details = _compute_coding_performance_score(coding_analytics, config["coding_performance"]["max_points"])
+    project_score, project_details = _compute_project_relevance_score(student_profile, job, config["project_relevance"]["max_points"])
+    elig_score, is_eligible, elig_details = _check_eligibility(student_profile, job, config["eligibility"]["max_points"], academic)
 
-    # 2. Coding Performance
-    coding_score, coding_details = _compute_coding_performance_score(
-        coding_analytics,
-        config["coding_performance"]["max_points"],
-    )
-
-    # 3. Project Relevance
-    project_score, project_details = _compute_project_relevance_score(
-        student_profile,
-        job,
-        config["project_relevance"]["max_points"],
-    )
-
-    # 4. Interview Readiness (placeholder — will be updated by Interview Agent)
-    interview_score = config["interview_readiness"]["max_points"] * 0.5  # Neutral default
-    interview_details = {"status": "pending_interview_agent"}
-
-    # 5. Eligibility
-    eligibility_score, is_eligible, eligibility_details = _check_eligibility(
-        student_profile,
-        job,
-        config["eligibility"]["max_points"],
-    )
-
-    # Total
-    total_score = round(
-        skill_score + coding_score + project_score + interview_score + eligibility_score, 2
-    )
-    max_total = sum(c["max_points"] for c in config.values())
-
-    # Extract matched and missing skill lists using canonicalization
-    try:
-        from app.services.company_service import canonicalize_skill
-    except Exception:
-        canonicalize_skill = lambda s: s.strip().lower()
-
-    student_skill_names = {s.get("name", "").lower().strip() for s in student_profile.get("skills", [])}
-    student_canonical = {canonicalize_skill(s.get("name", "")) for s in student_profile.get("skills", [])}
-    req_skills = job.get("required_skills", [])
-    pref_skills = job.get("preferred_skills", [])
-    matched_skills = [
-        s for s in req_skills + pref_skills
-        if s.lower().strip() in student_skill_names or canonicalize_skill(s) in student_canonical
+    # Interview performance is unknown until a supervised mock interview is graded:
+    # the component is excluded (not guessed) and the total is rescaled.
+    excluded = ["interview_readiness"] + ([] if coding_ok else ["coding_performance"])
+    breakdown = [
+        {"component": "skill_coverage", "points": skill_score, "max": config["skill_coverage"]["max_points"], "details": skill_details},
+        {"component": "coding_performance", "points": coding_score, "max": config["coding_performance"]["max_points"],
+         "details": coding_details, "excluded": not coding_ok},
+        {"component": "project_relevance", "points": project_score, "max": config["project_relevance"]["max_points"], "details": project_details},
+        {"component": "interview_readiness", "points": 0.0, "max": config["interview_readiness"]["max_points"],
+         "details": {"status": "not_assessed", "note": "Excluded until a graded mock interview exists"}, "excluded": True},
+        {"component": "eligibility", "points": elig_score, "max": config["eligibility"]["max_points"], "details": elig_details},
     ]
-    missing_skills = [
-        s for s in req_skills
-        if s.lower().strip() not in student_skill_names and canonicalize_skill(s) not in student_canonical
-    ]
+    available_max = sum(b["max"] for b in breakdown if not b.get("excluded"))
+    raw = sum(b["points"] for b in breakdown if not b.get("excluded"))
+    pct = round(raw / available_max * 100, 1) if available_max else 0.0
+    total = round(pct, 2)  # normalised to a 0-100 scale
 
-    # Confidence
-    confidence = _compute_match_confidence(
-        skill_score, coding_score, is_eligible, skill_details, config
-    )
+    have = canonical_set(student_profile.get("skills", []))
+    req, pref = job.get("required_skills", []), job.get("preferred_skills", [])
+    matched = [s for s in req + pref if canonical(s) in have]
+    missing = [s for s in req if canonical(s) not in have]
+    missing_pref = [s for s in pref if canonical(s) not in have]
+    confidence = _compute_match_confidence(skill_score, coding_score, is_eligible, skill_details, config,
+                                           coding_ok=coding_ok, stale=job.get("is_stale", False))
+
+    reasons = [f"Matches {skill_details.get('matched_required', 0)}/{skill_details.get('total_required', 0)} required skills"
+               + (f" (missing: {', '.join(missing)})" if missing else "")]
+    if elig_details["fail_reasons"]:
+        reasons.append("Not eligible: " + "; ".join(elig_details["fail_reasons"]))
+    elif elig_details["required_gpa"]:
+        reasons.append(f"Eligible: CGPA {elig_details['student_gpa']} ≥ {elig_details['required_gpa']} ({elig_details['gpa_source']})")
+    reasons.append(f"Projects using listed skills: {project_details.get('matching_projects', 0)}/{project_details.get('total_projects', 0)}")
+    if not coding_ok:
+        reasons.append("Coding activity excluded (no consented coding data)")
+    if job.get("is_stale"):
+        reasons.append("Listing has not been re-verified recently — confirm it is still open")
 
     return {
         "job_id": job.get("job_id"),
@@ -424,238 +276,158 @@ def _score_single_job(
         "role_title": job.get("role_title"),
         "role_family": job.get("role_family", "general"),
         "package_lpa": job.get("package_lpa"),
-        "match_score": total_score,
-        "max_score": max_total,
-        "match_percentage": round((total_score / max_total) * 100, 1) if max_total > 0 else 0,
+        "location": job.get("location"),
+        "deadline": job.get("deadline"),
+        "application_url": job.get("application_url"),
+        "listing_source": job.get("source"),
+        "listing_last_verified_at": job.get("last_verified_at"),
+        "is_stale": job.get("is_stale", False),
+        "target_role_match": _target_match(job, targets or []),
+        "requirements": {"required": req, "preferred": pref, "min_cgpa": job.get("min_cgpa"),
+                         "max_backlogs": job.get("max_backlogs"), "min_experience": job.get("min_experience")},
+        "match_score": total,
+        "max_score": 100.0,
+        "match_percentage": pct,
+        "excluded_components": excluded,
         "confidence": confidence,
         "is_eligible": is_eligible,
-        "is_low_confidence": confidence < LOW_CONFIDENCE_THRESHOLD,
-        "matched_skills": matched_skills,
-        "missing_skills": missing_skills,
-        "breakdown": [
-            {"component": "skill_coverage", "points": skill_score,
-             "max": config["skill_coverage"]["max_points"], "details": skill_details},
-            {"component": "coding_performance", "points": coding_score,
-             "max": config["coding_performance"]["max_points"], "details": coding_details},
-            {"component": "project_relevance", "points": project_score,
-             "max": config["project_relevance"]["max_points"], "details": project_details},
-            {"component": "interview_readiness", "points": interview_score,
-             "max": config["interview_readiness"]["max_points"], "details": interview_details},
-            {"component": "eligibility", "points": eligibility_score,
-             "max": config["eligibility"]["max_points"], "details": eligibility_details},
-        ],
+        "eligibility_verified": elig_details["verified"],
+        "is_low_confidence": confidence < LOW_CONFIDENCE_THRESHOLD or job.get("is_stale", False) or not elig_details["verified"],
+        "matched_skills": matched,
+        "missing_skills": missing,
+        "missing_preferred_skills": missing_pref,
+        "reasoning": ". ".join(reasons) + ".",
+        "application_status": "not_submitted",
+        "breakdown": breakdown,
     }
 
 
-def _get_llm():
-    """Get LLM for match reasoning only (lazy import)."""
-    from langchain_core.messages import SystemMessage, HumanMessage  # noqa: F401
-    from langchain_google_genai import ChatGoogleGenerativeAI
-    return ChatGoogleGenerativeAI(
-        model=settings.LLM_MODEL,
-        temperature=0.2,
-        google_api_key=settings.LLM_API_KEY if settings.LLM_API_KEY else "dummy",
-    )
+def compute_readiness_score(skill_gap_report: Optional[Dict[str, Any]], coding_analytics: Optional[Dict[str, Any]],
+                            student_profile: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Placement readiness against the student's *target roles* (not a single job):
+    skill coverage from the gap report, coding performance, and project relevance
+    to the union of verified requirements. Unassessed components are excluded.
+    """
+    coverage = (skill_gap_report or {}).get("overall_coverage", 0) or 0
+    skill_pts = round(coverage / 100 * config["skill_coverage"]["max_points"], 2)
+    coding_pts, coding_details = _compute_coding_performance_score(coding_analytics, config["coding_performance"]["max_points"])
+    coding_ok = coding_details.get("available", False)
+    req_skills = [g["skill"] for g in (skill_gap_report or {}).get("gaps", [])] + \
+                 [s["skill"] for s in (skill_gap_report or {}).get("strengths", [])]
+    proj_pts, proj_details = _compute_project_relevance_score(student_profile, {"required_skills": req_skills, "preferred_skills": []},
+                                                              config["project_relevance"]["max_points"])
+    breakdown = [
+        {"component": "skill_coverage", "points": skill_pts, "max": config["skill_coverage"]["max_points"],
+         "details": {"coverage": coverage, "source": (skill_gap_report or {}).get("citation")}},
+        {"component": "coding_performance", "points": coding_pts, "max": config["coding_performance"]["max_points"],
+         "details": coding_details, "excluded": not coding_ok},
+        {"component": "project_relevance", "points": proj_pts, "max": config["project_relevance"]["max_points"], "details": proj_details},
+        {"component": "interview_readiness", "points": 0.0, "max": config["interview_readiness"]["max_points"],
+         "details": {"status": "not_assessed"}, "excluded": True},
+    ]
+    available = sum(b["max"] for b in breakdown if not b.get("excluded"))
+    raw = sum(b["points"] for b in breakdown if not b.get("excluded"))
+    pct = round(raw / available * 100, 1) if available else 0.0
+    signals = []
+    signals.append(f"Skill coverage {coverage}% of verified requirements")
+    if coding_ok:
+        signals.append(f"Coding performance {coding_pts}/{config['coding_performance']['max_points']} ({coding_details.get('basis')})")
+    else:
+        signals.append("Coding performance excluded — no consented coding data")
+    signals.append(f"Projects aligned to target skills: {proj_details.get('matching_projects', 0)}/{proj_details.get('total_projects', 0)}")
+    return {"total": pct, "max": 100.0, "percentage": pct, "breakdown": breakdown,
+            "basis": "target_role_benchmarks", "signals": signals}
 
-
-# ---------------------------------------------------------------------------
-# Main Agent Node
-# ---------------------------------------------------------------------------
 
 def job_matching_agent_node(state: PlacementState) -> Dict[str, Any]:
-    """
-    LangGraph Node: Job Matching Agent.
+    """LangGraph node: Job Matching Agent."""
+    profile = state.get("student_profile")
+    if not profile:
+        return {"errors": ["JobMatchingAgent: No student profile available."], "current_step": "job_matching_agent"}
 
-    1. Reads student_profile, skill_gap_report, coding_analytics from state
-    2. Fetches available jobs (mock for Lab 7)
-    3. Runs DETERMINISTIC scoring engine for each job
-    4. Ranks jobs by match score
-    5. Uses LLM ONLY for reasoning/explanation generation
-    6. Flags low-confidence matches
-    7. Returns matching_result to state
-    """
-    logger.info("[JobMatchingAgent] Starting job matching and scoring...")
-
-    student_profile = state.get("student_profile")
-    if not student_profile:
-        return {
-            "errors": ["JobMatchingAgent: No student profile available."],
-            "current_step": "job_matching_agent",
-        }
+    try:
+        hub = get_hub(state)
+        jobs = hub.active_jobs()
+    except HubUnavailableError as exc:
+        return {"errors": [f"JobMatchingAgent: {exc}"], "current_step": "job_matching_agent"}
 
     skill_gap_report = state.get("skill_gap_report")
     coding_analytics = state.get("coding_analytics")
+    specialist = state.get("specialist_analysis") or {}
+    config = scoring_config_from_weights(specialist.get("scoring_weights"))
+    academic = (state.get("student_context") or {}).get("academic") or {}
+    targets = resolve_targets(state.get("target_roles") or [])
 
-    # ---------- STEP 1: Get available jobs ----------
-    available_jobs = _get_mock_available_jobs()
-    scoring_config = DEFAULT_SCORING_CONFIG
+    matches = [_score_single_job(profile, coding_analytics, job, config, academic, targets) for job in jobs]
+    matches.sort(key=lambda m: (m["target_role_match"] is None, not m["is_eligible"], -m["match_score"]))
 
-    # ---------- STEP 2: Score every job deterministically ----------
-    scored_matches = []
-    for job in available_jobs:
-        match = _score_single_job(student_profile, coding_analytics, job, scoring_config)
-        scored_matches.append(match)
+    low_conf = [
+        f"{m['company_name']} - {m['role_title']}: confidence={m['confidence']}"
+        + (" (stale listing)" if m["is_stale"] else "") + ("" if m["eligibility_verified"] else " (eligibility unverified)")
+        for m in matches if m["is_low_confidence"]
+    ]
 
-    # ---------- STEP 3: Rank by score descending ----------
-    scored_matches.sort(key=lambda x: x["match_score"], reverse=True)
+    readiness = compute_readiness_score(skill_gap_report, coding_analytics, profile, config)
+    target_matches = [m for m in matches if m["target_role_match"]]
+    narrative = (f"Evaluated {len(matches)} open listing(s) from the placement database; "
+                 f"{len(target_matches)} match your target roles and "
+                 f"{sum(1 for m in matches if m['is_eligible'])} are eligible.")
+    if not jobs:
+        narrative = "No open job listings are in the placement database yet; matches will appear once the Placement Cell lists drives."
 
-    # ---------- STEP 4: Compute readiness score (top match or average) ----------
-    if scored_matches:
-        top_match = scored_matches[0]
-        readiness_score = {
-            "total": top_match["match_score"],
-            "max": top_match["max_score"],
-            "percentage": top_match["match_percentage"],
-            "breakdown": top_match["breakdown"],
-        }
-    else:
-        readiness_score = {"total": 0, "max": 100, "percentage": 0, "breakdown": []}
+    llm = get_chat_model(temperature=0.2)
+    narration_method = "deterministic"
+    if llm is not None and matches:
+        try:
+            from langchain_core.messages import HumanMessage, SystemMessage
+            msg = llm.invoke([
+                SystemMessage(content="In two sentences, give career advice from these pre-scored matches. "
+                                      "Do not change scores, do not overstate fit, mention confidence."),
+                HumanMessage(content=str([{k: m[k] for k in ("company_name", "role_title", "match_percentage", "confidence",
+                                                               "is_eligible", "missing_skills")} for m in matches[:5]])),
+            ])
+            text = getattr(msg, "content", "")
+            if isinstance(text, str) and text.strip():
+                narrative += " [AI-generated advice] " + text.strip()[:500]
+                narration_method = "llm"
+        except Exception as exc:
+            logger.warning(f"[JobMatchingAgent] narration unavailable: {exc}")
 
-    # ---------- STEP 5: Flag low-confidence matches ----------
-    low_confidence_flags = []
-    for m in scored_matches:
-        if m["is_low_confidence"]:
-            low_confidence_flags.append(
-                f"{m['company_name']} - {m['role_title']}: confidence={m['confidence']} "
-                f"(below threshold {LOW_CONFIDENCE_THRESHOLD})"
-            )
-
-    # ---------- STEP 6: LLM reasoning ----------
-    try:
-        llm = _get_llm().with_structured_output(MatchReasoningBatch)
-
-        # Build a compact summary for the LLM (no raw data leaks)
-        matches_summary = []
-        for m in scored_matches[:5]:  # Only reason on top 5
-            matches_summary.append({
-                "job": f"{m['company_name']} - {m['role_title']}",
-                "score": f"{m['match_percentage']}%",
-                "confidence": m["confidence"],
-                "eligible": m["is_eligible"],
-                "skill_coverage": next(
-                    (b["details"].get("required_ratio", 0) for b in m["breakdown"]
-                     if b["component"] == "skill_coverage"), 0
-                ),
-            })
-
-        coding_pct = coding_analytics.get("summary", {}).get("coding_percentile", "N/A") if coding_analytics else "N/A"
-        student_skill_names = [s.get('name') for s in student_profile.get('skills', [])]
-        project_count = len(student_profile.get('projects', []))
-        skill_cov = skill_gap_report.get('overall_coverage', 'N/A') if skill_gap_report else 'N/A'
-
-        reasoning_prompt = f"""
-        You are the Job Matching Agent for a Placement Readiness system.
-
-        CRITICAL RULES:
-        1. Never overstate certainty — always include confidence levels
-        2. Low-confidence matches (confidence < {LOW_CONFIDENCE_THRESHOLD}) MUST be flagged explicitly
-        3. Provide specific, evidence-based reasoning for each match
-        4. The scoring numbers come from the scoring engine — do NOT recalculate
-        5. Be honest but constructive
-
-        STUDENT PROFILE SUMMARY:
-        - Skills: {student_skill_names}
-        - Projects: {project_count} projects
-        - Skill Coverage: {skill_cov}%
-        - Coding Percentile: {coding_pct}%
-
-        SCORED MATCHES (ranked by score — these are GROUND TRUTH):
-        {matches_summary}
-
-        LOW CONFIDENCE FLAGS:
-        {low_confidence_flags if low_confidence_flags else 'None'}
-
-        Generate specific reasoning for each match. Reference actual skill overlaps and gaps.
-        """
-
-        reasoning: MatchReasoningBatch = llm.invoke([
-            SystemMessage(content=reasoning_prompt),
-            HumanMessage(content="Generate match reasonings based on the scoring data above.")
-        ])
-
-        # Attach reasoning to matches
-        reasoning_map = {
-            f"{r.company_name} - {r.job_title}".lower(): r
-            for r in reasoning.match_reasonings
-        }
-
-        for m in scored_matches:
-            key = f"{m['company_name']} - {m['role_title']}".lower()
-            if key in reasoning_map:
-                r = reasoning_map[key]
-                m["reasoning"] = r.reasoning
-                m["fit_highlights"] = r.fit_highlights
-                m["concern_areas"] = r.concern_areas
-            else:
-                m["reasoning"] = f"Match score: {m['match_percentage']}%"
-                m["fit_highlights"] = []
-                m["concern_areas"] = []
-
-        overall_narrative = reasoning.overall_narrative
-        career_advice = reasoning.career_advice
-
-    except Exception as e:
-        logger.warning(f"[JobMatchingAgent] LLM reasoning failed, using fallback: {e}")
-        for m in scored_matches:
-            m["reasoning"] = (
-                f"Match score: {m['match_percentage']}% "
-                f"(confidence: {m['confidence']}). "
-                f"{'Eligible' if m['is_eligible'] else 'NOT eligible — does not meet minimum requirements'}."
-            )
-            m["fit_highlights"] = []
-            m["concern_areas"] = []
-        overall_narrative = f"Scored {len(scored_matches)} job matches."
-        career_advice = "Focus on closing skill gaps to improve match scores."
-
-    # ---------- STEP 7: Assemble final result ----------
     matching_result = {
-        "readiness_score": readiness_score,
-        "matches": scored_matches,
-        "total_jobs_evaluated": len(scored_matches),
-        "eligible_count": sum(1 for m in scored_matches if m["is_eligible"]),
-        "low_confidence_flags": low_confidence_flags,
-        "overall_narrative": overall_narrative,
-        "career_advice": career_advice,
-        "scoring_config_used": {k: v["weight"] for k, v in scoring_config.items()},
+        "status": "ok" if matches else "no_active_jobs",
+        "readiness_score": readiness,
+        "matches": matches,
+        "total_jobs_evaluated": len(matches),
+        "eligible_count": sum(1 for m in matches if m["is_eligible"]),
+        "target_role_match_count": len(target_matches),
+        "low_confidence_flags": low_conf,
+        "jobs_source": {"source": "companies_db", "listings": len(jobs)},
+        "overall_narrative": narrative,
+        "narration_method": narration_method,
+        "application_policy": APPLICATION_POLICY,
+        "applications_submitted": [],
+        "scoring_config_used": {k: v["weight"] for k, v in config.items()},
         "computed_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    # ---------- STEP 8: Evidence records ----------
-    from app.schemas.evidence import EvidenceRecord
-    evidence_records = []
-    for m in scored_matches:
-        evidence_records.append(EvidenceRecord(
-            entity_type="company_match",
-            evidence_type="deterministic_scoring",
-            source="job_matching_agent",
-            content=f"Job: {m['company_name']} - {m['role_title']}, "
-                       f"Score: {m['match_score']}/{m['max_score']}, "
-                       f"Confidence: {m['confidence']}, "
-                       f"Eligible: {m['is_eligible']}",
-            scope_tags=["matching", "scoring", m.get("role_family", "general")],
-        ).model_dump())
+    evidence = [EvidenceRecord(
+        entity_type="company_match", evidence_type="deterministic_scoring",
+        source=f"jobs_db: {m['company_name']} — {m['role_title']} ({m['listing_source']})",
+        content=(f"Score {m['match_score']}/100, confidence {m['confidence']}, eligible {m['is_eligible']}; "
+                 f"required matched {m['breakdown'][0]['details'].get('matched_required')}/{m['breakdown'][0]['details'].get('total_required')}."),
+        scope_tags=["matching", m.get("role_family", "general")],
+    ).model_dump() for m in matches]
+    evidence.append(EvidenceRecord(
+        entity_type="readiness_score", evidence_type="deterministic_scoring", source="skill_gap_report + coding_analytics",
+        content=f"Readiness {readiness['percentage']}% — " + "; ".join(readiness["signals"]),
+        scope_tags=["readiness"],
+    ).model_dump())
 
-    audit = AuditEvent(
-        action="job_matching_completed",
-        agent="JobMatchingAgent",
-        timestamp=datetime.now(timezone.utc).isoformat(),
-        details={
-            "jobs_evaluated": len(scored_matches),
-            "eligible_count": sum(1 for m in scored_matches if m["is_eligible"]),
-            "top_match": scored_matches[0]["match_percentage"] if scored_matches else 0,
-            "low_confidence_count": len(low_confidence_flags),
-        }
-    )
+    audit = AuditEvent(action="job_matching_completed", agent="JobMatchingAgent",
+                       timestamp=datetime.now(timezone.utc).isoformat(),
+                       details={"jobs_evaluated": len(matches), "eligible": matching_result["eligible_count"],
+                                "low_confidence": len(low_conf), "readiness": readiness["percentage"]})
 
-    logger.info(
-        f"[JobMatchingAgent] Complete — Evaluated: {len(scored_matches)} jobs, "
-        f"Eligible: {sum(1 for m in scored_matches if m['is_eligible'])}, "
-        f"Top Match: {scored_matches[0]['match_percentage'] if scored_matches else 0}%"
-    )
-
-    return {
-        "matching_result": matching_result,
-        "evidence_records": evidence_records,
-        "audit_events": [audit],
-        "current_step": "job_matching_agent",
-    }
+    return {"matching_result": matching_result, "evidence_records": evidence, "audit_events": [audit],
+            "current_step": "job_matching_agent"}

@@ -101,3 +101,13 @@ class Consent(Base):
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
     student = relationship("Student", back_populates="consents")
+
+
+class RevokedToken(Base):
+    """Access tokens ended by sign-out; checked on every authenticated request."""
+    __tablename__ = "revoked_tokens"
+
+    jti = Column(String(64), primary_key=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    revoked_at = Column(DateTime(timezone=True), default=utcnow)

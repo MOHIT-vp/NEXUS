@@ -1,122 +1,67 @@
 # Project Status — Placement Readiness & Career Intelligence Portal
 
-## Current Phase: PHASE D — SAFETY (Lab 14)
-
-**Last Updated**: 2026-09-02  
-**Overall Progress**: 100% (Lab 14 — Capstone complete, backend finished!)
-
----
-
-## Document Status
-
-| Document | Status | Last Updated |
-|----------|--------|-------------|
-| `REQUIREMENTS_TRACEABILITY.md` | ✅ Complete | 2026-08-26 |
-| `ARCHITECTURE.md` | ✅ Complete | 2026-08-26 |
-| `DATABASE_DESIGN.md` | ✅ Complete | 2026-08-26 |
-| `API_DESIGN.md` | ✅ Complete | 2026-08-26 |
-| `AGENT_ARCHITECTURE.md` | ✅ Complete | 2026-08-26 |
-| `SECURITY_MODEL.md` | ✅ Complete | 2026-08-26 |
-| `TEST_STRATEGY.md` | ✅ Complete | 2026-08-26 |
-| `DEPLOYMENT.md` | ✅ Complete | 2026-08-26 |
-| `IMPLEMENTATION_PLAN.md` | ✅ Complete | 2026-08-26 |
-| `PROJECT_STATUS.md` | ✅ Active | 2026-08-26 |
+**Last updated**: 2026-10-20
+**Backend tests**: 238 passing (`cd backend && pytest -q`)
+**Frontend**: `tsc` clean, `next build` passes; lint has no new errors versus the original pages.
 
 ---
 
-## Lab Progress
+## Lab progress (Chapter 9, §9.10)
 
-| Lab | Phase | Title | Status | Tests | Notes |
-|-----|-------|-------|--------|-------|-------|
-| Lab 1 | A | Coordinator Planner Loop | ⬜ Not Started | — | — |
-| Lab 2 | A | Tool-Using Agent | ⬜ Not Started | — | — |
-| Lab 3 | A | Reusable Skills | ⬜ Not Started | — | — |
-| Lab 4 | A | Memory & Retrieval | ⬜ Not Started | — | — |
-| Lab 5 | A | Governed Connector | ⬜ Not Started | — | — |
-| Lab 6 | A | Governed Runtime | ⬜ Not Started | — | — |
-| Lab 7 | B | Full Node Graph | ✅ Complete | 9/9 | All agents wired, graph compiled, tests passing |
-| Lab 8 | B | Parallel Processing | ✅ Complete | — | Parallel fan-out/fan-in and batch processing added |
-| Lab 9 | C | Evidence Grounding | ✅ Complete | — | EvidenceRecord schema, agent grounding, validation gate, GET /evidence API |
-| Lab 10 | C | Self-Healing | ✅ Complete | 13/13 | healing_target routing, regeneration_router, failure injection tests |
-| Lab 11 | C | Acceptance Suite | ✅ Complete | 60/60 | schema, evidence, pipeline & self-healing contracts; conftest fixtures |
-| Lab 12 | D | Safety & Governance | ✅ Complete | 16/16 | RBAC, consent API, approval workflow, versioning/rollback, security headers, rate limiting |
-| Lab 13 | D | Domain Specialists | ✅ Complete | 6/6 | Role-family configs (software, analytics, core, higher_studies) and API endpoints |
-| Lab 14 | D | Capstone | ✅ Complete | 3/3 | Dashboard APIs, Admin API, full e2e contract validation |
+| Lab | Title | Status | Where | Tests |
+|-----|-------|--------|-------|-------|
+| 1 | Planner loop (clarify → plan → revise) | ✅ | `services/planner.py`, `POST /planner/clarify`, Career Goal section on `/onboarding` | `test_gap_fixes.py` (clarifying questions) |
+| 2 | Tool-using agent | ✅ | Resume parser, role requirements, coding platforms read through typed connectors | `test_pipeline_contract.py` |
+| 3 | Reusable skills | ✅ | `agents/coordinator.build_plan` (locked plan), `graph.assemble_draft` (formatter) | `test_lab7_smoke.py` |
+| 4 | Memory & retrieval | ✅ | Run state (LangGraph) vs stored knowledge (`knowledge_documents`); tag filters + full-text, re-ranked by a local sentence-embedding model (bge-small, meaning-based); anonymised similar prior students | `test_gap_fixes.py` (retrieval, similar students) |
+| 5 | Governed connector | ✅ | `connectors/hub.py` — every agent reads consent, profile, coding data, requirements, jobs and knowledge through it | `tests/fakes.FakeHub` swaps the source with no agent change |
+| 6 | Governed runtime | ✅ | Budgets, plan lock, audit log; progress saved to SQLite after every node — interrupted runs resume from the last completed step (on startup, or `POST /workflows/{id}/resume`) | `test_checkpoint_resume.py` |
+| 7 | Full node graph | ✅ | `agents/graph.py` — bounded validation → regenerate back-edge | `test_lab7_smoke.py` |
+| 8 | Parallel | ✅ | Skill Gap ‖ Coding Analytics per student; batch re-run of many students; best-of-N: 4 roadmap candidates built in parallel, the best by plan alignment is kept | `test_gap_fixes.py`, `test_checkpoint_resume.py` |
+| 9 | Evidence grounding | ✅ | Evidence record per output; `GET /evidence` scoped to the owner | `test_pipeline_contract.py` |
+| 10 | Self-healing | ✅ | Diagnose → regenerate the failing part → escalate | `test_lab10.py` |
+| 11 | Acceptance suite as gate | ✅ | 19 checks; only fully passing runs enter the officer queue (`validation_failed` otherwise) | `test_gap_fixes.py` (validation gate) |
+| 12 | Safety & governance | ✅ | Officer-only approve / edit / override (warnings only, reason ≥ 20 chars); versioned publish; rollback re-validated against current consent; server-side sign-out | `test_gap_fixes.py` |
+| 13 | Domain specialists | ✅ | Software / analytics / core / higher-studies packs applied in the graph | `test_gap_fixes.py` (specialists) |
+| 14 | Capstone | ✅ | Student flow, officer console with inline report, admin page, audit trail | Full suite |
 
----
+## What changed in this round
 
-## Component Status
+- **Chat** answers only from the signed-in student's own published plan.
+- **Preparedness self-check** uses the student's own published plan (or own run); with no data it says so instead of scoring a sample profile. Cohort analytics use real published plans only, officer-only.
+- **Drives are stored in the database.** Officer-created drives survive restarts and are exactly what the Job Matching Agent matches against; closed drives and passed deadlines are not matched. The five sample companies are now an optional seed (`scripts/seed_sample_drives.py`), labelled "[Sample company]".
+- **Rollback** re-runs validation on the old version and refuses (409, audited) if required checks fail or the student has withdrawn a consent the version relies on.
+- **Sign-out** revokes the token on the server (`POST /auth/logout`, `revoked_tokens` table); refresh tokens can be revoked too.
+- **Admin page** (`/admin`): system stats, create / activate / deactivate staff accounts, audit log. Admins cannot approve plans.
+- **Officer report view**: inline readiness signals, cited gaps, matches with confidence and reasoning (low-confidence flagged), roadmap, mock-interview plan, validation results.
+- **Mock-interview practice**: students answer questions from their published plan and get feedback — model-generated and labelled when an LLM key is set, otherwise a transparent rubric. Answers are not stored.
+- **Roadmap export**: "Download roadmap" on the student roadmap tab.
+- **Batch re-run** (Lab 8) is Placement Cell only and uses each student's own resume, roles and current consent.
+- Code execution endpoints require sign-in.
 
-### Backend
-| Component | Status | Tests |
-|-----------|--------|-------|
-| Project scaffolding | ⏳ | — |
-| Database models | ⏳ | — |
-| Migrations | ⏳ | — |
-| Auth (JWT) | ⏳ | — |
-| RBAC | ⬜ | — |
-| Resume upload API | ✅ | — |
-| Consent API | ⬜ | — |
-| Profile API | ✅ | — |
-| Analysis API | ✅ | — |
-| Matching API | ✅ | — |
-| Interview API | ✅ | — |
-| Evidence API | ✅ | — |
-| Versioning API | ⏳ | — |
-| Audit API | ✅ | — |
-| Dashboard API | ✅ | 1 test |
-| Admin API | ✅ | 1 test |
+## Data sources
 
-### Agent System
-| Component | Status | Tests |
-|-----------|--------|-------|
-| LangGraph state schema | ✅ | — |
-| Coordinator | ✅ | — |
-| Resume Agent | ✅ | — |
-| Job Matching Agent | ✅ | 3 tests | Deterministic scoring engine + LLM reasoning |
-| Skill Gap Agent | ✅ | 2 tests | Hybrid: deterministic gap + LLM narration |
-| Coding Analytics Agent | ✅ | 2 tests | Deterministic stats + LLM narration |
-| Interview Agent | ✅ | — | Mock Q&A + roadmap generation |
-| Validation Agent | ✅ | 2 tests | 12 deterministic checks, zero LLM |
-| Connector Layer (Governed) | ✅ | — | + Coding connector added |
-| Memory & Retrieval (pgvector) | ✅ | — |
-| Scoring engine | ✅ | — | 5-component weighted scoring |
-| Self-healing loop | ✅ | 13 tests | Targeted agent regeneration, priority routing, retry budget |
+| Source | How | Limits |
+|--------|-----|--------|
+| Resume | Student upload, consent required | — |
+| GitHub | Public REST API, consent required | 60 requests/hour without `GITHUB_TOKEN`, 5,000 with |
+| LeetCode | Public GraphQL endpoint, consent required | Unofficial; can change without notice — reported as "unavailable", never guessed |
+| Academic records | Self-entered CGPA, used only with consent | Not connected to a college system |
+| Role requirements | Placement Cell benchmark library (seeded) + drive skill lists | No edit UI for benchmarks yet |
+| Knowledge base | PostgreSQL full-text + local hashed embeddings | pgvector supported but not installed |
 
-### Frontend
-| Component | Status | Tests |
-|-----------|--------|-------|
-| Next.js scaffolding | ⏳ | — |
-| Design system | ⬜ | — |
-| Auth pages | ⬜ | — |
-| Student portal | ⬜ | — |
-| Officer dashboard | ⬜ | — |
-| Admin panel | ⬜ | — |
+## Latest additions
 
-### Infrastructure
-| Component | Status |
-|-----------|--------|
-| Docker Compose | ⬜ |
-| PostgreSQL + pgvector | ⬜ |
-| Redis | ⬜ |
-| Mock data seeding | ⬜ |
+- **Resume interrupted runs (Lab 6):** LangGraph progress is saved to `backend/data/checkpoints.sqlite` after every node. A run cut off by a crash resumes from the last completed step automatically when the server starts; a failed run can be resumed by the Placement Cell (`POST /api/v1/workflows/{run_id}/resume`, progress at `GET .../progress`). Earlier steps are not repeated.
+- **Best-of-N roadmap (Lab 8):** the Interview Agent builds four roadmap candidates in parallel (gaps first, student priorities first, quick wins first, fit the timeline) and keeps the one that best fits the locked plan (required-gap coverage, ordering, priorities, timeline). All candidate scores are stored and shown in the officer report.
+- **Skill benchmark editor:** Placement Cell console → *Skill Benchmarks* — change level / importance, add or remove skills per role; every change is audited and applies to the next analysis.
+- **Meaning-based similarity (Lab 4):** a local embedding model (`BAAI/bge-small-en-v1.5` via fastembed, ~64 MB, downloaded once to `backend/data/models`, no API key) re-ranks retrieval and finds similar prior students. Falls back to lexical hashing if the model can't load.
+- **Sessions renew automatically:** the 30-minute sign-in token is renewed with a one-time refresh token, so long sessions (e.g. a 45-minute mock test) aren't cut off; refresh tokens rotate and are revoked on sign-out.
+- **Mock Interview:** aptitude, verbal, CS fundamentals (DBMS/OS/CN/OOPs), coding, spoken English, essay — chosen question count and timer, graded results, attempt history.
 
----
+## Known remaining gaps
 
-## Blocking Issues
-
-_None currently — awaiting plan review._
-
----
-
-## Decisions Log
-
-| Date | Decision | Rationale |
-|------|----------|-----------|
-| 2026-08-26 | Use LangGraph for agent orchestration | Explicit graph, checkpointing, state machine — matches spec |
-| 2026-08-26 | PostgreSQL + pgvector for vector retrieval | Avoids separate vector DB; recommended by spec |
-| 2026-08-26 | Deterministic scoring engine (not LLM) | Scores must be explainable and reproducible |
-| 2026-08-26 | JWT auth (not session-based) | Stateless, suitable for API-first architecture |
-| 2026-08-26 | Mock coding platform connector | Real platform APIs require credentials; mock for MVP |
-| 2026-08-26 | Async Q&A mock interview (not real-time chat) | Simpler to build and test; extensible later |
-| 2026-08-26 | Celery for background agent execution | Long-running graph execution shouldn't block API |
+1. **LLM key** — `LLM_API_KEY` in `.env` is a placeholder; the chat assistant needs a real key, and AI-written summaries / resume extraction / open-answer feedback switch on with it.
+2. **Question bank size** — 15 aptitude, 15 verbal, 32 CS, 5 coding, 10 spoken, 8 essay prompts.
+3. **Deployment** — runs locally; `docker-compose.yml` has not been tested.
+4. Old demo accounts `officer@demo.com` / `student@demo.com` (password `password123`) should be deactivated from `/admin`.

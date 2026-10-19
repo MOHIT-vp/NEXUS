@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models.user import User, Student
-from app.services.auth import decode_token
+from app.services.auth import decode_token, is_revoked
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=False)
 
@@ -42,6 +42,9 @@ async def get_current_user(
     user_id = payload.get("sub")
     if not user_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token payload")
+
+    if await is_revoked(db, payload):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Signed out — please sign in again")
 
     result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
     user = result.scalar_one_or_none()
@@ -87,3 +90,13 @@ def scope_student_access(user: User, target_student_id: uuid.UUID, student: Opti
         # For cases where we just have user + student_id but no Student object loaded yet
         # The caller should verify student.user_id == user.id
     # Officers, faculty, and admins can access any student's data
+
+
+async def can_view_run(db: AsyncSession, user: User, run) -> bool:
+    """A student may view only their own runs; the Placement Cell (and admin) may view any run."""
+    if user.role in ("placement_officer", "admin"):
+        return True
+    if user.role == "student":
+        result = await db.execute(select(Student.id).where(Student.user_id == user.id))
+        return result.scalar_one_or_none() == run.student_id
+    return False
