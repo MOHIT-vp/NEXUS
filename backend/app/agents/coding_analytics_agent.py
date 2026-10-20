@@ -261,7 +261,7 @@ def coding_analytics_agent_node(state: PlacementState) -> Dict[str, Any]:
     section = summarize_sources(sources)
     narration = _deterministic_narration(section, sources)
     narration_method = "deterministic"
-    llm = get_chat_model(temperature=0.3)
+    llm = get_chat_model(temperature=0.3, agent_name="coding_analytics_agent")
     if llm is not None and section["summary"].get("data_available"):
         try:
             from langchain_core.messages import HumanMessage, SystemMessage

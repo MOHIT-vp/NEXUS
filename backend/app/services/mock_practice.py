@@ -49,7 +49,7 @@ def _rubric(question: Dict[str, Any], answer: str) -> Dict[str, Any]:
 
 
 def _llm(question: Dict[str, Any], answer: str) -> Dict[str, Any]:
-    llm = get_chat_model(temperature=0.2)
+    llm = get_chat_model(temperature=0.2, agent_name="mock_practice")
     if llm is None:
         return {}
     from langchain_core.messages import HumanMessage, SystemMessage

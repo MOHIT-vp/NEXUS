@@ -1,8 +1,8 @@
-version: '3.8'
-
 services:
   postgres:
     image: postgres:15-alpine
+    container_name: nexus-postgres
+    restart: unless-stopped
     environment:
       POSTGRES_USER: placement_user
       POSTGRES_PASSWORD: placement_pass
@@ -19,6 +19,8 @@ services:
 
   redis:
     image: redis:7-alpine
+    container_name: nexus-redis
+    restart: unless-stopped
     ports:
       - "6379:6379"
     volumes:
@@ -28,6 +30,38 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: nexus-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://placement_user:placement_pass@postgres:5432/placement_portal
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: nexus-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    depends_on:
+      - backend
 
 volumes:
   postgres_data:

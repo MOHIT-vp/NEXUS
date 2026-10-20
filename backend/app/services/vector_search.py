@@ -10,9 +10,20 @@ from app.config import settings
 
 def get_embedder():
     """Configure the standard embedding model for the system."""
+    key = settings.LLM_API_KEY
+    if not settings._is_valid_key(key):
+        pool = settings.get_pool_keys()
+        if pool:
+            key = pool[0]
+        else:
+            for ag in ("resume_agent", "job_matching_agent", "skill_gap_agent", "interview_agent"):
+                cand = settings.get_agent_llm_config(ag).get("api_key")
+                if settings._is_valid_key(cand):
+                    key = cand
+                    break
     return GoogleGenerativeAIEmbeddings(
         model="models/embedding-001",
-        google_api_key=settings.LLM_API_KEY if settings.LLM_API_KEY else "dummy",
+        google_api_key=key if settings._is_valid_key(key) else "dummy",
     )
 
 async def generate_embedding(text: str) -> List[float]:

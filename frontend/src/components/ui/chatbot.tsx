@@ -2,6 +2,8 @@
 
 import { useState, useRef, useEffect } from "react";
 import { MessageCircle, X, Send, Bot, User, Loader2 } from "lucide-react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { getActiveRunId, getSessionUser, sendChatMessage } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -10,7 +12,7 @@ export function Chatbot() {
   const [messages, setMessages] = useState<{ role: string; content: string }[]>([
     {
       role: "assistant",
-      content: "Hi! I'm NEXUS AI 👋\nI can help you understand your placement profile, assessment results, skill gaps, roadmap, and anything else about NEXUS.\n\nWhat would you like to know?"
+      content: "Hi! I'm NEXUS AI 👋\n\nI can help you understand your placement profile, assessment results, skill gaps, roadmap, and anything else about NEXUS.\n\nWhat would you like to know?"
     }
   ]);
   const [input, setInput] = useState("");
@@ -92,7 +94,7 @@ export function Chatbot() {
       {/* Chat Panel */}
       <div
         className={cn(
-          "fixed bottom-6 right-6 w-[360px] h-[600px] max-h-[80vh] flex flex-col z-50",
+          "fixed bottom-6 right-6 w-[360px] sm:w-[450px] h-[640px] max-h-[85vh] flex flex-col z-50",
           "bg-ivory rounded-[20px] shadow-2xl border border-border-subtle transition-all duration-300 transform origin-bottom-right",
           isOpen ? "scale-100 opacity-100" : "scale-90 opacity-0 pointer-events-none"
         )}
@@ -122,7 +124,7 @@ export function Chatbot() {
             <div
               key={idx}
               className={cn(
-                "flex gap-3 max-w-[85%]",
+                "flex gap-3 max-w-[92%]",
                 msg.role === "user" ? "ml-auto flex-row-reverse" : "mr-auto"
               )}
             >
@@ -132,14 +134,69 @@ export function Chatbot() {
               )}>
                 {msg.role === "user" ? <User className="w-4 h-4" /> : <Bot className="w-4 h-4" />}
               </div>
-              <div className={cn(
-                "px-4 py-2.5 rounded-[16px] text-sm whitespace-pre-wrap",
-                msg.role === "user" 
-                  ? "bg-charcoal text-white rounded-tr-sm" 
-                  : "bg-white border border-border-subtle text-charcoal rounded-tl-sm shadow-sm"
-              )}>
-                {msg.content}
-              </div>
+
+              {msg.role === "user" ? (
+                <div className="px-4 py-2.5 rounded-[16px] text-sm bg-charcoal text-white rounded-tr-sm whitespace-pre-wrap">
+                  {msg.content}
+                </div>
+              ) : (
+                <div className="px-4 py-3 rounded-[16px] text-sm bg-white border border-border-subtle text-charcoal rounded-tl-sm shadow-xs overflow-hidden leading-relaxed">
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm]}
+                    components={{
+                      h1: ({ children }) => (
+                        <h1 className="text-sm font-bold text-charcoal mt-2 mb-1.5 flex items-center gap-1.5">{children}</h1>
+                      ),
+                      h2: ({ children }) => (
+                        <h2 className="text-xs font-bold text-charcoal uppercase tracking-wider mt-3 mb-1.5 text-orange border-b border-border-subtle/50 pb-1">{children}</h2>
+                      ),
+                      h3: ({ children }) => (
+                        <h3 className="text-xs font-semibold text-charcoal mt-2 mb-1">{children}</h3>
+                      ),
+                      p: ({ children }) => (
+                        <p className="mb-2 leading-relaxed text-charcoal/90 last:mb-0 text-xs sm:text-sm">{children}</p>
+                      ),
+                      ul: ({ children }) => (
+                        <ul className="list-disc list-outside pl-4 mb-2 space-y-1 text-xs sm:text-sm">{children}</ul>
+                      ),
+                      ol: ({ children }) => (
+                        <ol className="list-decimal list-outside pl-4 mb-2 space-y-1 text-xs sm:text-sm">{children}</ol>
+                      ),
+                      li: ({ children }) => (
+                        <li className="leading-relaxed">{children}</li>
+                      ),
+                      strong: ({ children }) => (
+                        <strong className="font-semibold text-charcoal">{children}</strong>
+                      ),
+                      hr: () => (
+                        <hr className="my-2.5 border-border-subtle/60" />
+                      ),
+                      code: ({ children }) => (
+                        <code className="bg-surface-warm px-1.5 py-0.5 rounded text-xs font-mono text-orange border border-border-subtle/40">
+                          {children}
+                        </code>
+                      ),
+                      table: ({ children }) => (
+                        <div className="overflow-x-auto my-2 rounded-lg border border-border-subtle shadow-2xs">
+                          <table className="w-full text-xs text-left border-collapse">{children}</table>
+                        </div>
+                      ),
+                      th: ({ children }) => (
+                        <th className="bg-surface-warm font-semibold px-2 py-1.5 border-b border-border-subtle text-charcoal whitespace-nowrap">
+                          {children}
+                        </th>
+                      ),
+                      td: ({ children }) => (
+                        <td className="px-2 py-1.5 border-b border-border-subtle/40 text-bronze-dark/90 align-top">
+                          {children}
+                        </td>
+                      ),
+                    }}
+                  >
+                    {msg.content}
+                  </ReactMarkdown>
+                </div>
+              )}
             </div>
           ))}
           
@@ -148,7 +205,7 @@ export function Chatbot() {
               <div className="w-8 h-8 rounded-full bg-orange text-white flex items-center justify-center shrink-0">
                 <Bot className="w-4 h-4" />
               </div>
-              <div className="px-4 py-3 rounded-[16px] bg-white border border-border-subtle rounded-tl-sm shadow-sm flex items-center gap-1">
+              <div className="px-4 py-3 rounded-[16px] bg-white border border-border-subtle rounded-tl-sm shadow-xs flex items-center gap-1">
                 <div className="w-1.5 h-1.5 bg-orange/60 rounded-full animate-bounce [animation-delay:-0.3s]"></div>
                 <div className="w-1.5 h-1.5 bg-orange/60 rounded-full animate-bounce [animation-delay:-0.15s]"></div>
                 <div className="w-1.5 h-1.5 bg-orange/60 rounded-full animate-bounce"></div>

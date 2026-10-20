@@ -363,7 +363,7 @@ def skill_gap_agent_node(state: PlacementState) -> Dict[str, Any]:
     summary = (f"Evidence-backed coverage of {report['overall_coverage']}% across {len(report['per_role'])} target role(s); "
                f"{len(report['required_gaps'])} required and {len(report['preferred_gaps'])} preferred skill gaps.")
     narration_method = "deterministic"
-    llm = get_chat_model(temperature=0.2)
+    llm = get_chat_model(temperature=0.2, agent_name="skill_gap_agent")
     if llm is not None:
         try:
             from langchain_core.messages import HumanMessage, SystemMessage

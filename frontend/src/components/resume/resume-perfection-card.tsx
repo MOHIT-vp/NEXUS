@@ -458,11 +458,30 @@ export function ResumePerfectionCard({
     <div className="surface-card p-6 lg:p-8 space-y-6">
       {/* Header */}
       <div className="border-b border-border-subtle pb-4">
-        <div className="flex items-center gap-2 mb-1.5">
-          <span className="p-1.5 rounded-lg bg-orange/10 text-orange">
-            <ShieldCheck className="w-5 h-5" />
-          </span>
-          <h3 className="type-h3 text-charcoal">{title}</h3>
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-1.5">
+          <div className="flex items-center gap-2">
+            <span className="p-1.5 rounded-lg bg-orange/10 text-orange">
+              <ShieldCheck className="w-5 h-5" />
+            </span>
+            <h3 className="type-h3 text-charcoal">{title}</h3>
+          </div>
+          <PBButton
+            variant="secondary"
+            size="sm"
+            onClick={handleRetake}
+            disabled={regenerating || submitting}
+            title="Generate a fresh set of verification questions"
+          >
+            {regenerating ? (
+              <>
+                <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" /> Shuffling...
+              </>
+            ) : (
+              <>
+                <RotateCcw className="w-3.5 h-3.5 mr-1.5" /> Change Questions
+              </>
+            )}
+          </PBButton>
         </div>
         <p className="text-xs text-bronze-dark/70 leading-relaxed">
           {subtitle}

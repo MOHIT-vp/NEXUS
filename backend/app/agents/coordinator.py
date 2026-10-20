@@ -47,7 +47,7 @@ def plan_workflow(state: PlacementState) -> Dict[str, Any]:
 
     plan = build_plan(state)
     method = "deterministic"
-    llm = get_chat_model(temperature=0.1)
+    llm = get_chat_model(temperature=0.1, agent_name="coordinator")
     if llm is not None:
         try:
             from langchain_core.messages import HumanMessage, SystemMessage

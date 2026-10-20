@@ -244,7 +244,7 @@ def interview_agent_node(state: PlacementState) -> Dict[str, Any]:
         tips.append(f"Your roadmap totals about {total_hours} hours; over {weeks} weeks that is ~{round(total_hours / weeks, 1)} hours/week.")
     tips.append("Prepare STAR-format answers for behavioural questions.")
 
-    llm = get_chat_model(temperature=0.4)
+    llm = get_chat_model(temperature=0.4, agent_name="interview_agent")
     narration_method = "deterministic"
     if llm is not None and focus:
         try:

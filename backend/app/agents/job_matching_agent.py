@@ -376,7 +376,7 @@ def job_matching_agent_node(state: PlacementState) -> Dict[str, Any]:
     if not jobs:
         narrative = "No open job listings are in the placement database yet; matches will appear once the Placement Cell lists drives."
 
-    llm = get_chat_model(temperature=0.2)
+    llm = get_chat_model(temperature=0.2, agent_name="job_matching_agent")
     narration_method = "deterministic"
     if llm is not None and matches:
         try:

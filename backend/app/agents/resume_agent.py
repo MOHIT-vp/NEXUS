@@ -62,7 +62,7 @@ def _now() -> str:
 
 
 def _llm_extract(clean_text: str) -> Optional[Dict[str, Any]]:
-    llm = get_chat_model(temperature=0.0)
+    llm = get_chat_model(temperature=0.0, agent_name="resume_agent")
     if llm is None:
         return None
     from langchain_core.messages import SystemMessage

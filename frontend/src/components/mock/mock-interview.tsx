@@ -31,7 +31,7 @@ function getRecognition(): any {
   const r = new R();
   r.continuous = true;
   r.interimResults = true;
-  r.lang = "en-IN";
+  r.lang = (typeof navigator !== "undefined" && navigator.language) ? navigator.language : "en-IN";
   return r;
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
@@ -98,7 +98,11 @@ export function MockInterview() {
 
   const stopRecording = useCallback(() => {
     if (recRef.current) {
-      recRef.current.stop();
+      try {
+        recRef.current.stop();
+      } catch (e) {
+        console.warn("Error stopping speech recognition:", e);
+      }
       recRef.current = null;
     }
     setRecording(false);
@@ -134,28 +138,83 @@ export function MockInterview() {
     if (stage === "test" && secondsLeft <= 0) finish();
   }, [stage, secondsLeft, finish]);
 
-  function startRecording(qid: string) {
-    const r = getRecognition();
-    if (!r) {
-      setError("Speech recognition isn't supported in this browser — use Chrome or Edge, or type your answer.");
+  async function startRecording(qid: string) {
+    setError("");
+
+    // 1. Verify browser support
+    const R = typeof window !== "undefined" && ((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition);
+    if (!R) {
+      setError("Speech recognition is not supported in this browser. Please open in Google Chrome or Microsoft Edge, or type your answer directly in the text box.");
       return;
     }
-    const before = String(answers[qid] ?? "");
+
+    // 2. Request mic permission explicitly to trigger permission prompt and catch errors
+    try {
+      if (typeof navigator !== "undefined" && navigator.mediaDevices?.getUserMedia) {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach((track) => track.stop());
+      }
+    } catch (err: any) {
+      if (err.name === "NotAllowedError" || err.name === "PermissionDeniedError") {
+        setError("Microphone permission was blocked. Please click the lock icon in your browser address bar to allow microphone access, or type your answer.");
+        return;
+      }
+      if (err.name === "NotFoundError" || err.name === "DevicesNotFoundError") {
+        setError("No microphone found on your device. Please plug in a microphone, or type your answer.");
+        return;
+      }
+    }
+
+    const r = getRecognition();
+    if (!r) return;
+
+    const before = String(answers[qid] ?? "").trim();
+
     /* eslint-disable @typescript-eslint/no-explicit-any */
     r.onresult = (ev: any) => {
       let text = "";
-      for (let i = 0; i < ev.results.length; i++) text += ev.results[i][0].transcript;
-      setAnswers((a) => ({ ...a, [qid]: (before ? before + " " : "") + text.trim() }));
+      for (let i = 0; i < ev.results.length; i++) {
+        text += ev.results[i][0].transcript + " ";
+      }
+      const newText = text.trim();
+      setAnswers((a) => ({
+        ...a,
+        [qid]: before ? `${before} ${newText}` : newText,
+      }));
     };
-    /* eslint-enable @typescript-eslint/no-explicit-any */
+
+    r.onerror = (ev: any) => {
+      console.warn("Speech recognition error:", ev.error);
+      setRecording(false);
+      if (ev.error === "not-allowed") {
+        setError("Microphone permission was denied by the browser. Please allow microphone access in your browser settings, or type your answer.");
+      } else if (ev.error === "no-speech") {
+        setError("No speech was detected. Please speak closer to your microphone, or type your answer.");
+      } else if (ev.error === "network") {
+        setError("Speech recognition network error. Chrome's speech recognizer requires an internet connection to Google's speech servers. You can type your answer instead.");
+      } else if (ev.error === "audio-capture") {
+        setError("No microphone detected. Please check your audio input settings, or type your answer.");
+      } else {
+        setError(`Speech recognition note: ${ev.error}. You can continue by typing your answer.`);
+      }
+    };
+
     r.onend = () => {
       setDurations((d) => ({ ...d, [qid]: (d[qid] ?? 0) + (Date.now() - recStart.current) / 1000 }));
       setRecording(false);
     };
-    recStart.current = Date.now();
-    r.start();
-    recRef.current = r;
-    setRecording(true);
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+
+    try {
+      recStart.current = Date.now();
+      r.start();
+      recRef.current = r;
+      setRecording(true);
+    } catch (err: any) {
+      console.warn("Failed to start speech recognition:", err);
+      setError("Could not start speech recognition. You can type your answer directly in the box below.");
+      setRecording(false);
+    }
   }
 
   /* ------------------------------ HOME ------------------------------ */
@@ -363,12 +422,14 @@ export function MockInterview() {
                 ) : (
                   <PBButton size="sm" onClick={() => startRecording(q.id)}><Mic className="w-4 h-4" /> Speak your answer</PBButton>
                 )}
-                {recording && <span className="text-sm text-danger flex items-center gap-2"><span className="w-2 h-2 rounded-full bg-danger animate-pulse-soft" /> Listening…</span>}
+                {recording && <span className="text-sm text-danger flex items-center gap-2"><span className="w-2 h-2 rounded-full bg-danger animate-pulse-soft" /> Listening… speak into your microphone</span>}
               </div>
               <textarea value={String(ans ?? "")} onChange={(e) => setAnswers({ ...answers, [q.id]: e.target.value })} rows={6}
-                placeholder="Your transcript appears here as you speak. (No microphone? You can type instead.)"
+                placeholder="Your transcript appears here as you speak. (No microphone or speech recognition not working? You can type your answer directly in this box!)"
                 className="w-full px-4 py-3 text-sm bg-surface border border-border-default rounded-[12px]" />
-              <p className="text-xs text-bronze-dark/50">Speech is turned into text by your browser's speech service (in Chrome this uses Google's servers). NEXUS stores neither audio nor text — only your score.</p>
+              <p className="text-xs text-bronze-dark/50">
+                Speech recognition uses your browser's built-in speech engine (Google Chrome or Microsoft Edge recommended). You can also type or edit your transcript directly. NEXUS evaluates your answer's structure, vocabulary, and relevance.
+              </p>
             </>
           )}
 

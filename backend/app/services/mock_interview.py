@@ -178,7 +178,7 @@ def _rubric_essay(text: str) -> Dict[str, Any]:
 
 def _llm_grade(kind: str, prompt: str, text: str) -> Optional[Dict[str, Any]]:
     from app.agents.llm import get_chat_model
-    llm = get_chat_model(temperature=0.2)
+    llm = get_chat_model(temperature=0.2, agent_name="mock_interview")
     if llm is None or not text.strip():
         return None
     from langchain_core.messages import HumanMessage, SystemMessage
