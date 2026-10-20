@@ -45,3 +45,16 @@ async def test_next_analysis_uses_the_edited_benchmark(client, db_factory, refer
     report = (await client.get(f"/api/v1/approvals/{run_id}/report", headers=officer["headers"])).json()
     gaps = {g["skill"]: g for g in report["result_snapshot"]["skill_gap_report"]["gaps"]}
     assert "Rust" in gaps and gaps["Rust"]["importance"] == "required" and gaps["Rust"]["benchmark_source"] == "TPO 2026"
+
+
+def test_every_benchmark_and_sample_drive_skill_has_a_learning_resource():
+    """Otherwise RETRIEVAL_GROUNDED fails and the plan needs an officer override."""
+    from app.core.skills import canonical
+    from app.services.reference_data import BENCHMARKS, LEARNING_RESOURCES
+    from scripts._sample_drives import SAMPLE_DRIVES
+    have = {canonical(k) for k in LEARNING_RESOURCES}
+    needed = {canonical(r[0]): r[0] for rows in BENCHMARKS.values() for r in rows}
+    for d in SAMPLE_DRIVES:
+        needed.update({canonical(s): s for s in d["required_skills"] + d["preferred_skills"]})
+    missing = sorted(v for k, v in needed.items() if k not in have)
+    assert not missing, f"No learning resource for: {missing}"

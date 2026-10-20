@@ -34,3 +34,21 @@ async def test_retrieval_finds_resources_by_meaning(model_backend, db_factory, r
         res = await kb.retrieve(db, "how relational databases store and query tables", doc_types=["learning_resource"], k=3)
     assert res.status == "ok" and res.backend.startswith("postgres_fts+model:")
     assert any("sql" in i.title.lower() or "database" in i.title.lower() or "dbms" in i.title.lower() for i in res.items)
+
+
+async def test_every_required_skill_retrieves_its_own_resource(model_backend, db_factory, reference_data):
+    """The Skill Gap Agent's lookup ("<skill> learning resource", top 3, matched by tag) finds every skill."""
+    from app.agents.knowledge_base import kb
+    from app.core.skills import canonical, display_name
+    from app.services.reference_data import BENCHMARKS
+    from scripts._sample_drives import SAMPLE_DRIVES
+    skills = {canonical(r[0]) for rows in BENCHMARKS.values() for r in rows}
+    for d in SAMPLE_DRIVES:
+        skills |= {canonical(s) for s in d["required_skills"] + d["preferred_skills"]}
+    missing = []
+    async with db_factory() as db:
+        for key in sorted(skills):
+            res = await kb.retrieve(db, f"{display_name(key)} learning resource", doc_types=["learning_resource"], k=3)
+            if not any(key in [canonical(t) for t in i.tags] for i in res.items):
+                missing.append(display_name(key))
+    assert not missing, missing

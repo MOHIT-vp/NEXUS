@@ -34,6 +34,8 @@ CHUNK_OVERLAP = 200
 _STOPWORDS = {
     "the", "and", "for", "with", "what", "are", "how", "into", "from", "that", "this", "your",
     "skills", "skill", "requirements", "role", "roles", "a", "an", "of", "to", "in", "on", "is",
+    # every resource says "learning resource", so these words would outrank the skill itself
+    "learning", "resource", "resources",
 }
 
 
@@ -140,9 +142,7 @@ class CareerKnowledgeBase:
     ) -> RetrievalResult:
         if self.backend == "pgvector":
             return self._pgvector_retrieve(query, k)
-        tsq = _or_query(query)
-        if not tsq:
-            return RetrievalResult(status="empty", backend=self.backend, query=query)
+        tsq = _or_query(query)   # None for names keyword search can't handle (e.g. "C", "C++")
         try:
             conditions = ["search_vector @@ to_tsquery('english', :q)"]
             params: Dict[str, Any] = {"q": tsq, "k": k}
@@ -161,7 +161,7 @@ class CareerKnowledgeBase:
                 ORDER BY score DESC
                 LIMIT :k
             """)
-            rows = (await db.execute(sql, params)).fetchall()
+            rows = (await db.execute(sql, params)).fetchall() if tsq else []
             if not rows:   # no keyword overlap: nearest documents by similarity within the tag filters
                 params["k"] = 500
                 sql = text(f"""
