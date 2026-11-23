@@ -7,8 +7,12 @@ Import path: tests/conftest.py  (auto-loaded by pytest for all test files)
 import os
 import tempfile
 
-# No LLM or network calls during tests; uploads go to a temporary folder
-os.environ["LLM_API_KEY"] = ""
+# No LLM or network calls during tests; uploads go to a temporary folder.
+# Blank EVERY AI key setting (global, pool and per-agent) so a real backend/.env never reaches a provider.
+import re as _re
+_config_src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app", "config.py")).read()
+for _name in set(_re.findall(r"\b([A-Z][A-Z0-9_]*API_KEYS?)\b", _config_src)) | {"LLM_API_KEY", "LLM_API_KEYS"}:
+    os.environ[_name] = ""
 os.environ.setdefault("UPLOAD_DIR", tempfile.mkdtemp(prefix="placement-uploads-"))
 # Run checkpoints go to a throwaway file; similarity uses the no-download embeddings unless a test opts in
 os.environ["CHECKPOINT_DB_PATH"] = os.path.join(tempfile.mkdtemp(prefix="placement-ckpt-"), "checkpoints.sqlite")

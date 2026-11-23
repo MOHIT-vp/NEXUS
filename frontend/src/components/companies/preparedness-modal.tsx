@@ -7,7 +7,6 @@ import {
   AlertTriangle,
   Building2,
   Calendar,
-  DollarSign,
   GraduationCap,
   BookOpen,
   Sparkles,
@@ -127,7 +126,7 @@ export function PreparednessModal({ job, isOpen, onClose, studentRunId }: Prepar
               <p className="text-sm font-semibold text-charcoal/90 mt-0.5">{job.role_title}</p>
               <div className="flex items-center gap-4 text-xs text-bronze-dark/60 mt-1 flex-wrap">
                 <span className="flex items-center gap-1 font-semibold text-charcoal">
-                  <DollarSign className="w-3.5 h-3.5 text-orange" /> ₹{job.package_lpa} LPA
+                  ₹{job.package_lpa} LPA
                 </span>
                 <span className="flex items-center gap-1">
                   <GraduationCap className="w-3.5 h-3.5 text-bronze" /> Min CGPA: {job.min_cgpa}

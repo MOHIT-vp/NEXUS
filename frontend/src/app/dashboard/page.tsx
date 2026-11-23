@@ -11,7 +11,6 @@ import {
   ExternalLink,
   Sparkles,
   Calendar,
-  DollarSign,
   GraduationCap,
   CheckCircle,
   Search,
@@ -693,7 +692,7 @@ export default function DashboardPage() {
                               <p className="font-semibold text-charcoal text-sm">{d.role_title}</p>
                               <div className="flex items-center gap-3 text-xs text-bronze-dark/60 mt-1">
                                 <span className="font-bold text-orange flex items-center gap-0.5">
-                                  <DollarSign className="w-3.5 h-3.5" /> ₹{d.package_lpa} LPA
+                                  ₹{d.package_lpa} LPA
                                 </span>
                                 {d.drive_date && (
                                   <span className="flex items-center gap-1">

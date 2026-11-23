@@ -29,7 +29,6 @@ import {
   Trash2,
   Search,
   Calendar,
-  DollarSign,
   GraduationCap,
 } from "lucide-react";
 import Link from "next/link";
@@ -609,7 +608,7 @@ export default function OfficerDashboardPage() {
                       {/* Package & Cutoff */}
                       <div className="flex items-center gap-3 text-xs pt-1 border-t border-border-subtle flex-wrap">
                         <span className="font-bold text-orange flex items-center gap-1">
-                          <DollarSign className="w-3.5 h-3.5" /> ₹{d.package_lpa} LPA
+                          ₹{d.package_lpa} LPA
                         </span>
                         <span className="text-bronze-dark/70 flex items-center gap-1">
                           <GraduationCap className="w-3.5 h-3.5 text-bronze" /> Min CGPA: {d.min_cgpa}
